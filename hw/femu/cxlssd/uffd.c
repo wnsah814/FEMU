@@ -29,9 +29,19 @@
 #include <sys/ioctl.h>
 #include <sys/vfs.h>
 
+/*
+ * A resolved fill pins its page until the thread that faulted on it faults
+ * elsewhere, which it does only after making its access, or at most this long.
+ * Unpinned, a policy that evicts the newest entry (LIFO) zaps each page right
+ * after its CONTINUE, and the waiters fault on it again and again.
+ */
+#define UFFD_PIN_NS 1000000
+
 typedef struct UffdTimer {
     uint64_t lpn;
     int64_t due;
+    uint32_t tid;               /* the thread whose fault started the fill */
+    bool resolved;
 } UffdTimer;
 
 struct FemuUffd {
@@ -50,8 +60,10 @@ struct FemuUffd {
     bool flush_done;
     bool flush_ok;
     int64_t flush_ns;
-    GHashTable *pending;        /* lpn -> UffdTimer, fills not yet resolved */
-    GQueue timers;              /* the same, by due time */
+    GHashTable *pending;        /* lpn -> UffdTimer, pages not yet evictable */
+    GQueue timers;              /* fills not yet resolved, by due time */
+    GQueue pins;                /* resolved fills still pinned, by due time */
+    GHashTable *pinned;         /* tid -> its resolved, pinned fill */
     GQueue deferred;            /* read fills waiting for a slot */
     int64_t evict_ns;           /* write-back time of the current miss */
     int64_t stime;
@@ -68,8 +80,10 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     MemoryRegion *mr = host_memory_backend_get_memory(backend);
     struct uffdio_api api = {
         .api = UFFD_API,
-        .features = UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM,
+        .features = UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM |
+                    UFFD_FEATURE_THREAD_ID,
     };
+    const uint64_t features = api.features;
     struct statfs fs;
     FemuUffd *u;
     int fd = memory_region_get_fd(mr);
@@ -100,9 +114,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     }
     *reason = "the kernel lacks shmem minor faults or shmem write-protect";
     if (ioctl(u->fd, UFFDIO_API, &api) ||
-        (api.features & (UFFD_FEATURE_MINOR_SHMEM |
-                         UFFD_FEATURE_WP_HUGETLBFS_SHMEM)) !=
-        (UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM)) {
+        (api.features & features) != features) {
         close(u->fd);
         g_free(u);
         return NULL;
@@ -116,6 +128,8 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     qemu_cond_init(&u->flushed);
     u->pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     g_queue_init(&u->timers);
+    g_queue_init(&u->pins);
+    u->pinned = g_hash_table_new(NULL, NULL);
     g_queue_init(&u->deferred);
     return u;
 }
@@ -177,11 +191,35 @@ static gint timer_cmp(gconstpointer a, gconstpointer b, gpointer unused)
     return x->due < y->due ? -1 : x->due > y->due;
 }
 
+static void uffd_unpin(FemuUffd *u, UffdTimer *t)
+{
+    gpointer tid = GUINT_TO_POINTER(t->tid);
+
+    if (g_hash_table_lookup(u->pinned, tid) == t) {
+        g_hash_table_remove(u->pinned, tid);
+    }
+    g_queue_remove(&u->pins, t);
+    g_hash_table_remove(u->pending, &t->lpn);
+}
+
+/* Unpin resolved fills past their time limit; with @all, every one. */
+static bool uffd_release(FemuUffd *u, int64_t now, bool all)
+{
+    UffdTimer *t;
+    bool freed = false;
+
+    while ((t = g_queue_peek_head(&u->pins)) && (all || t->due <= now)) {
+        uffd_unpin(u, t);
+        freed = true;
+    }
+    return freed;
+}
+
 /*
  * Give a fill whose read is charged its cache slot, and schedule it after the
- * read and the victim's write-back. A victim still being filled cannot be
- * evicted, and a page mapped without a slot would never be zapped or charged
- * again, so the fill waits until a fill resolves and frees a slot.
+ * read and the victim's write-back. A victim still being filled, or pinned,
+ * cannot be evicted, and a page mapped without a slot would never be zapped
+ * or charged again, so the fill waits until a slot is freed.
  */
 static void uffd_place(FemuUffd *u, UffdTimer *t)
 {
@@ -195,15 +233,30 @@ static void uffd_place(FemuUffd *u, UffdTimer *t)
     g_queue_insert_sorted(&u->timers, t, timer_cmp, NULL);
 }
 
-static void uffd_miss(FemuUffd *u, uint64_t lpn)
+/* Deferred fills take the slots that were freed, in the order they came. */
+static void uffd_retry(FemuUffd *u)
+{
+    guint n = u->deferred.length;
+
+    while (n--) {
+        uffd_place(u, g_queue_pop_head(&u->deferred));
+    }
+}
+
+static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid)
 {
     FemuCxlCache *cache = u->der->cache;
     UffdTimer *t;
     int64_t stime;
 
     u->der->uffd_faults++;
-    if (g_hash_table_contains(u->pending, &lpn)) {
-        return;                 /* the fill in flight wakes every waiter */
+    t = g_hash_table_lookup(u->pending, &lpn);
+    if (t) {
+        /* The fill in flight wakes every waiter; a resolved one is mapped. */
+        if (t->resolved) {
+            uffd_continue(u, lpn);
+        }
+        return;
     }
     if (g_hash_table_lookup(cache->entries, &lpn)) {
         uffd_continue(u, lpn);  /* resident: a fault that raced its fill */
@@ -211,8 +264,9 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn)
     }
     cache->misses++;
     stime = now_ns();
-    t = g_new(UffdTimer, 1);
+    t = g_new0(UffdTimer, 1);
     t->lpn = lpn;
+    t->tid = tid;
     t->due = stime + u->der->media(u->der->media_opaque, lpn, false, stime);
     u->der->uffd_ns_ftl += now_ns() - stime;
     g_hash_table_insert(u->pending, &t->lpn, t);
@@ -235,27 +289,34 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
 }
 
 /*
- * Resolve fills whose media time has passed; with @all, every pending fill.
- * A deferred fill waits only for an in-cache fill, which is on the timer
- * queue, so with @all both queues drain.
+ * Resolve fills whose media time has passed, and pin their pages; with @all,
+ * resolve every pending fill and unpin everything. A deferred fill waits only
+ * for an in-cache fill, which is on the timer or pinned queue, so with @all
+ * all three drain.
  */
 static void uffd_fire(FemuUffd *u, bool all)
 {
     int64_t now = now_ns();
-    UffdTimer *t;
+    UffdTimer *t, *old;
     bool freed;
-    guint n;
 
     do {
         freed = false;
         while ((t = g_queue_peek_head(&u->timers)) && (all || t->due <= now)) {
             g_queue_pop_head(&u->timers);
             uffd_continue(u, t->lpn);
-            g_hash_table_remove(u->pending, &t->lpn);
-            freed = true;
+            t->resolved = true;
+            t->due = now + UFFD_PIN_NS;
+            g_queue_push_tail(&u->pins, t);
+            old = g_hash_table_lookup(u->pinned, GUINT_TO_POINTER(t->tid));
+            if (old) {
+                uffd_unpin(u, old);
+                freed = true;
+            }
+            g_hash_table_insert(u->pinned, GUINT_TO_POINTER(t->tid), t);
         }
-        for (n = freed ? u->deferred.length : 0; n; n--) {
-            uffd_place(u, g_queue_pop_head(&u->deferred));
+        if (uffd_release(u, now, all) || freed) {
+            uffd_retry(u);
         }
     } while (all && !g_queue_is_empty(&u->timers));
 }
@@ -287,11 +348,17 @@ static void *uffd_thread(void *opaque)
             { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 }, { u->cmd, POLLIN, 0 },
         };
         UffdTimer *t = g_queue_peek_head(&u->timers);
+        /* A pin's time limit needs a wake-up only when a fill waits on it. */
+        UffdTimer *g = u->deferred.length ? g_queue_peek_head(&u->pins)
+                                          : NULL;
         struct timespec ts, *tsp = NULL;
         int64_t busy;
         uint64_t faults = 0;
         ssize_t n;
 
+        if (g && (!t || g->due < t->due)) {
+            t = g;
+        }
         if (t) {
             int64_t wait = MAX(0, t->due - now_ns());
 
@@ -306,6 +373,8 @@ static void *uffd_thread(void *opaque)
         busy = now_ns();
         while ((n = read(u->fd, m, sizeof(m))) > 0) {
             for (size_t i = 0; i < n / sizeof(m[0]); i++) {
+                uint32_t tid = m[i].arg.pagefault.feat.ptid;
+                UffdTimer *pin;
                 uint64_t lpn;
 
                 if (m[i].event != UFFD_EVENT_PAGEFAULT) {
@@ -313,10 +382,16 @@ static void *uffd_thread(void *opaque)
                 }
                 faults++;
                 lpn = (m[i].arg.pagefault.address - (uintptr_t)u->host) / 4096;
+                /* A thread faulting elsewhere has made its access. */
+                pin = g_hash_table_lookup(u->pinned, GUINT_TO_POINTER(tid));
+                if (pin && pin->lpn != lpn) {
+                    uffd_unpin(u, pin);
+                    uffd_retry(u);
+                }
                 if (m[i].arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
                     uffd_wp_fault(u, lpn);
                 } else {
-                    uffd_miss(u, lpn);
+                    uffd_miss(u, lpn, tid);
                 }
             }
         }
@@ -512,6 +587,8 @@ void femu_uffd_destroy(FemuCxlDer *der)
     qemu_cond_destroy(&u->flushed);
     qemu_mutex_destroy(&u->lock);
     g_queue_clear(&u->timers);
+    g_queue_clear(&u->pins);
+    g_hash_table_destroy(u->pinned);
     g_queue_clear(&u->deferred);
     g_hash_table_destroy(u->pending);
     g_free(u);
