@@ -13779,6 +13779,81 @@ static void femu_test_cxl_wait(void *obj, void *data,
     unlink(rom_path);
 }
 
+static bool femu_cxl_active(QTestState *qts)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute':'qom-get','arguments':{"
+                          "'path':'/machine/peripheral/ssd',"
+                          "'property':'der-active'}}");
+    bool active;
+
+    g_assert_true(qdict_haskey(rsp, "return"));
+    active = qdict_get_bool(rsp, "return");
+    qobject_unref(rsp);
+    return active;
+}
+
+/*
+ * der=uffd under qtest: QEMU's own accesses to the window raise user-mode
+ * faults, so no privilege is needed. 64 pages written through a 16-page
+ * cache: 48 dirty evictions, then 16 more once never-written pages push the
+ * rest out, and none for clean evictions.
+ */
+static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QTestState *qts = qtest_init(
+        "-machine q35,cxl=on -m 128M "
+        "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 "
+        "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
+        "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on "
+        "-device femu-cxl-ssd,id=ssd,bus=rp0,volatile-memdev=mem,"
+        "cache-pages=16,cache-ways=16,der=uffd,read-ns=1000,program-ns=1000");
+    uint64_t i;
+
+    femu_cxl_decode(qts);
+    /* The first access goes through MMIO and maps the whole window. */
+    qtest_writeq(qts, FEMU_CXL_WINDOW, 0);
+    if (!femu_cxl_active(qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        qtest_quit(qts);
+        return;
+    }
+    for (i = 0; i < 64; i++) {
+        qtest_writeq(qts, FEMU_CXL_WINDOW + i * 4096, 0x1000 + i);
+    }
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 48);
+    for (i = 0; i < 64; i++) {
+        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + (1000 + i) * 4096),
+                        ==, 0);
+    }
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 64);
+    for (i = 0; i < 64; i++) {
+        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + i * 4096),
+                        ==, 0x1000 + i);
+    }
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 64);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), >=, 64);
+
+    /* A flush programs the one dirty resident page once. */
+    qtest_writeq(qts, FEMU_CXL_WINDOW + 2000 * 4096, 0xf1);
+    femu_cxl_set(qts, "flush-cache", true);
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 65);
+    femu_cxl_set(qts, "flush-cache", true);
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 65);
+
+    /* A configuration write unmaps the window; the next access maps it. */
+    femu_cxl_config(qts, 53, PCI_COMMAND, PCI_COMMAND_MEMORY);
+    g_assert_false(femu_cxl_active(qts));
+    femu_cxl_config(qts, 53, 0x18, 0x90010000);
+    femu_cxl_config(qts, 53, 0x1c, 0);
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 5 * 4096), ==, 0x1005);
+    g_assert_true(femu_cxl_active(qts));
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 7 * 4096), ==, 0x1007);
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 2000 * 4096), ==, 0xf1);
+    femu_cxl_set(qts, "realized", false);
+    qtest_quit(qts);
+}
+
 static void femu_test_cxl_no_ftl(void *obj, void *data,
                                  QGuestAllocator *alloc)
 {
@@ -13863,6 +13938,7 @@ static void femu_register_nodes(void)
                  &(QOSGraphTestOptions) { .arg = (void *)"cylon" });
     qos_add_test("cxl-der-invalid", "femu", femu_test_cxl_der_invalid, NULL);
     qos_add_test("cxl-der", "femu", femu_test_cxl_der, NULL);
+    qos_add_test("cxl-uffd", "femu", femu_test_cxl_uffd, NULL);
     qos_add_test("cxl-wait-invalidate", "femu", femu_test_cxl_wait,
                  &(QOSGraphTestOptions) { .arg = (void *)2 });
     qos_add_test("cxl-wait", "femu", femu_test_cxl_wait, NULL);

@@ -165,6 +165,11 @@ void femu_cxl_der_clear(FemuCxlDer *der)
     GHashTableIter it;
     gpointer key;
 
+    if (der->uffd) {
+        femu_uffd_uninstall(der);
+        return;
+    }
+
     while (g_hash_table_size(der->maps)) {
         g_hash_table_iter_init(&it, der->maps);
         g_hash_table_iter_next(&it, &key, NULL);

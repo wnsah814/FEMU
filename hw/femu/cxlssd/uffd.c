@@ -15,6 +15,7 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "system/hostmem.h"
+#include "system/kvm.h"
 #include "der.h"
 #include "uffd.h"
 
@@ -36,11 +37,18 @@ struct FemuUffd {
     FemuCxlDer *der;
     int fd;
     int stop;
+    int cmd;                    /* eventfd: a flush request from flush-cache */
     uint8_t *host;
     uint64_t size;
     MemoryRegion alias;
+    MemoryRegion *container;    /* where the alias was added, once */
     bool installed;
     QemuThread thread;
+    QemuMutex lock;             /* a flush request and its reply */
+    QemuCond flushed;
+    bool flush_done;
+    bool flush_ok;
+    int64_t flush_ns;
     GHashTable *pending;        /* lpn -> UffdTimer, fills not yet resolved */
     GQueue timers;              /* the same, by due time */
     int64_t evict_ns;           /* write-back time of the current miss */
@@ -71,7 +79,9 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     }
     u = g_new0(FemuUffd, 1);
     *reason = "userfaultfd for kernel faults needs CAP_SYS_PTRACE";
-    u->fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    /* Without KVM (TCG, qtest) every fault is QEMU's own, in user mode. */
+    u->fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK |
+                    (kvm_enabled() ? 0 : UFFD_USER_MODE_ONLY));
     if (u->fd < 0) {
         g_free(u);
         return NULL;
@@ -89,6 +99,9 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     u->host = memory_region_get_ram_ptr(mr);
     u->size = memory_region_size(mr);
     u->stop = eventfd(0, EFD_CLOEXEC);
+    u->cmd = eventfd(0, EFD_CLOEXEC);
+    qemu_mutex_init(&u->lock);
+    qemu_cond_init(&u->flushed);
     u->pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     g_queue_init(&u->timers);
     return u;
@@ -190,16 +203,34 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
     ioctl(u->fd, UFFDIO_WRITEPROTECT, &w);
 }
 
-static void uffd_fire(FemuUffd *u)
+/* Resolve fills whose media time has passed; with @all, every pending fill. */
+static void uffd_fire(FemuUffd *u, bool all)
 {
     int64_t now = now_ns();
     UffdTimer *t;
 
-    while ((t = g_queue_peek_head(&u->timers)) && t->due <= now) {
+    while ((t = g_queue_peek_head(&u->timers)) && (all || t->due <= now)) {
         g_queue_pop_head(&u->timers);
         uffd_continue(u, t->lpn);
         g_hash_table_remove(u->pending, &t->lpn);
     }
+}
+
+/* flush-cache: write back and zap every resident page, from the handler. */
+static void uffd_flush(FemuUffd *u)
+{
+    bool ok;
+
+    uffd_fire(u, true);
+    u->stime = now_ns();
+    u->evict_ns = 0;
+    ok = femu_cxl_cache_clear(u->der->cache, uffd_evict, u);
+    qemu_mutex_lock(&u->lock);
+    u->flush_ok = ok;
+    u->flush_ns = u->evict_ns;
+    u->flush_done = true;
+    qemu_cond_broadcast(&u->flushed);
+    qemu_mutex_unlock(&u->lock);
 }
 
 static void *uffd_thread(void *opaque)
@@ -208,7 +239,9 @@ static void *uffd_thread(void *opaque)
     struct uffd_msg m[32];
 
     for (;;) {
-        struct pollfd p[2] = { { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 } };
+        struct pollfd p[3] = {
+            { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 }, { u->cmd, POLLIN, 0 },
+        };
         UffdTimer *t = g_queue_peek_head(&u->timers);
         struct timespec ts, *tsp = NULL;
         int64_t busy;
@@ -221,7 +254,7 @@ static void *uffd_thread(void *opaque)
             ts.tv_nsec = wait % NANOSECONDS_PER_SECOND;
             tsp = &ts;
         }
-        if (ppoll(p, 2, tsp, NULL) < 0 && errno != EINTR) {
+        if (ppoll(p, 3, tsp, NULL) < 0 && errno != EINTR) {
             break;
         }
         if (p[1].revents) {
@@ -243,7 +276,14 @@ static void *uffd_thread(void *opaque)
                 }
             }
         }
-        uffd_fire(u);
+        if (p[2].revents) {
+            uint64_t v;
+
+            if (read(u->cmd, &v, sizeof(v)) == sizeof(v)) {
+                uffd_flush(u);
+            }
+        }
+        uffd_fire(u, false);
         u->der->uffd_ns_busy += now_ns() - busy;
     }
     return NULL;
@@ -254,7 +294,11 @@ bool femu_uffd_installed(FemuCxlDer *der)
     return der->uffd_state && der->uffd_state->installed;
 }
 
-/* The first decoded access maps the whole window; the handler owns the cache. */
+/*
+ * The first decoded access maps the whole window, and the handler owns the
+ * cache while it is mapped. Entries already resident stay resident: their
+ * pages fault once and are continued at no media cost.
+ */
 bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw)
 {
     FemuUffd *u = der->uffd_state;
@@ -267,46 +311,99 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw)
     if (u->installed) {
         return true;
     }
-    if (fw->size != u->size) {
-        femu_cxl_der_fallback(der, "uffd maps the whole window onto the backend");
-        der->uffd_state = NULL;
+    if (fw->size != u->size || (u->container && u->container != &fw->mr)) {
+        femu_cxl_der_fallback(der, "uffd maps one whole window onto the backend");
+        femu_uffd_destroy(der);
         return false;
     }
-    femu_cxl_cache_clear(der->cache, NULL, NULL);
     if (madvise(u->host, u->size, MADV_DONTNEED) ||
         ioctl(u->fd, UFFDIO_REGISTER, &reg)) {
         femu_cxl_der_fallback(der, "uffd registration failed");
-        der->uffd_state = NULL;
+        femu_uffd_destroy(der);
         return false;
     }
     qemu_thread_create(&u->thread, "femu-cxl-uffd", uffd_thread, u,
                        QEMU_THREAD_JOINABLE);
-    memory_region_init_alias(&u->alias, OBJECT(der->dev), "femu-cxl-uffd",
-                             ram, 0, u->size);
-    memory_region_add_subregion_overlap(&fw->mr, 0, &u->alias, 1);
+    if (!u->container) {
+        memory_region_init_alias(&u->alias, OBJECT(der->dev), "femu-cxl-uffd",
+                                 ram, 0, u->size);
+        memory_region_add_subregion_overlap(&fw->mr, 0, &u->alias, 1);
+        u->container = &fw->mr;
+    } else {
+        memory_region_set_enabled(&u->alias, true);
+    }
     u->installed = true;
     der->available = true;
+    der->remaps++;
     return true;
+}
+
+/*
+ * Invalidation and teardown: stop the handler, resolve the faults it had in
+ * flight, stop catching faults and hand the cache back to the MMIO path.
+ */
+void femu_uffd_uninstall(FemuCxlDer *der)
+{
+    FemuUffd *u = der->uffd_state;
+    struct uffdio_range r;
+    uint64_t v = 1;
+
+    if (!u || !u->installed) {
+        return;
+    }
+    if (write(u->stop, &v, sizeof(v)) != sizeof(v)) {
+        error_report("femu-cxl-uffd: cannot stop the handler");
+    }
+    qemu_thread_join(&u->thread);
+    if (read(u->stop, &v, sizeof(v)) != sizeof(v)) {
+        error_report("femu-cxl-uffd: cannot rearm the handler");
+    }
+    uffd_fire(u, true);
+    /* Unregistering also wakes any fault still waiting on the range. */
+    r = (struct uffdio_range) { (uintptr_t)u->host, u->size };
+    ioctl(u->fd, UFFDIO_UNREGISTER, &r);
+    memory_region_set_enabled(&u->alias, false);
+    u->installed = false;
+    der->available = false;
+    der->revocations++;
+}
+
+bool femu_uffd_flush(FemuCxlDer *der, uint64_t *ns)
+{
+    FemuUffd *u = der->uffd_state;
+    uint64_t v = 1;
+
+    qemu_mutex_lock(&u->lock);
+    u->flush_done = false;
+    if (write(u->cmd, &v, sizeof(v)) != sizeof(v)) {
+        qemu_mutex_unlock(&u->lock);
+        return false;
+    }
+    while (!u->flush_done) {
+        qemu_cond_wait(&u->flushed, &u->lock);
+    }
+    *ns = u->flush_ns;
+    qemu_mutex_unlock(&u->lock);
+    return u->flush_ok;
 }
 
 void femu_uffd_destroy(FemuCxlDer *der)
 {
     FemuUffd *u = der->uffd_state;
-    uint64_t one = 1;
 
     if (!u) {
         return;
     }
-    if (u->installed) {
-        if (write(u->stop, &one, sizeof(one)) != sizeof(one)) {
-            error_report("femu-cxl-uffd: cannot stop the handler");
-        }
-        qemu_thread_join(&u->thread);
-        memory_region_del_subregion(u->alias.container, &u->alias);
+    femu_uffd_uninstall(der);
+    if (u->container) {
+        memory_region_del_subregion(u->container, &u->alias);
         object_unparent(OBJECT(&u->alias));
     }
     close(u->fd);
     close(u->stop);
+    close(u->cmd);
+    qemu_cond_destroy(&u->flushed);
+    qemu_mutex_destroy(&u->lock);
     g_queue_clear_full(&u->timers, NULL);
     g_hash_table_destroy(u->pending);
     g_free(u);
@@ -325,6 +422,15 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw)
 }
 
 bool femu_uffd_installed(FemuCxlDer *der)
+{
+    return false;
+}
+
+void femu_uffd_uninstall(FemuCxlDer *der)
+{
+}
+
+bool femu_uffd_flush(FemuCxlDer *der, uint64_t *ns)
 {
     return false;
 }

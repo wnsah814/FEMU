@@ -403,7 +403,10 @@ static void cxl_flush(Object *obj, bool value, Error **errp)
     if (!s->started || s->closing || !value) {
         goto out;
     }
-    if (!femu_cxl_cache_clear(&s->cache, cxl_evict, &op)) {
+    /* With der=uffd mapped, the fault handler owns the cache. */
+    if (femu_uffd_installed(&s->direct) ?
+        !femu_uffd_flush(&s->direct, &op.ns) :
+        !femu_cxl_cache_clear(&s->cache, cxl_evict, &op)) {
         error_setg(errp, "CXL cache cannot flush: NAND is full");
     }
     if (op.ns) {
