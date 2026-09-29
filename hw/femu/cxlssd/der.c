@@ -35,7 +35,14 @@ void femu_cxl_der_init(FemuCxlDer *der, CXLType3Dev *dev, const char *mode,
     der->cache = cache;
     der->maps = g_hash_table_new(g_int64_hash, g_int64_equal);
     der->cylon = mode && !strcmp(mode, "cylon");
-    if (der->cylon) {
+    der->uffd = mode && !strcmp(mode, "uffd");
+    if (der->uffd) {
+        der->probes++;
+        der->uffd_state = femu_uffd_prepare(der, &reason);
+        if (!der->uffd_state) {
+            femu_cxl_der_fallback(der, reason);
+        }
+    } else if (der->cylon) {
         der->probes++;
         der->fast = femu_cylon_prepare(der, &reason);
         if (!der->fast) {
@@ -94,6 +101,10 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa)
     CXLFixedWindow *fw;
     MemoryRegion *ram;
 
+    if (der->uffd) {
+        fw = der->uffd_state ? der_window(der, hpa) : NULL;
+        return fw && femu_uffd_map(der, fw);
+    }
     if ((!der->available && !der->fast) || (hpa & 4095) != (dpa & 4095)) {
         return false;
     }
@@ -163,6 +174,7 @@ void femu_cxl_der_clear(FemuCxlDer *der)
 
 void femu_cxl_der_destroy(FemuCxlDer *der)
 {
+    femu_uffd_destroy(der);
     femu_cxl_der_clear(der);
     femu_cylon_destroy(der);
     der->available = false;

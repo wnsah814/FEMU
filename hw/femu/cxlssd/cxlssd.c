@@ -146,6 +146,46 @@ static void *cxl_worker(void *opaque)
     return NULL;
 }
 
+/* Queue one request for the FTL worker and wait for it; needs no BQL. */
+static void cxl_ftl(FemuCxlSsd *s, FemuCxlWork *work)
+{
+    qemu_mutex_lock(&s->lock);
+    QSIMPLEQ_INSERT_TAIL(&s->work, work, next);
+    qemu_cond_broadcast(&s->wake);
+    while (!work->done) {
+        qemu_cond_wait(&s->wake, &s->lock);
+    }
+    qemu_mutex_unlock(&s->lock);
+}
+
+/* der=uffd: the fault handler's media access, outside the BQL. */
+static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
+                              int64_t stime)
+{
+    FemuCxlSsd *s = opaque;
+    FemuCxlWork work = {
+        .req = {
+            .cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ,
+            .ns = &s->ns,
+            .slba = lpn * 8,
+            .nlb = 8,
+            .stime = stime,
+        },
+    };
+
+    if (!s->ftl) {
+        return 0;
+    }
+    cxl_ftl(s, &work);
+    qatomic_add(&s->media_ns, work.latency);
+    if (write) {
+        qatomic_inc(&s->media_writes);
+    } else {
+        qatomic_inc(&s->media_reads);
+    }
+    return work.latency;
+}
+
 /*
  * Requests from different accesses queue for the worker in arrival order; the
  * NAND model overlaps them where they reach different LUNs.
@@ -167,13 +207,7 @@ static bool cxl_media(FemuCxlOp *op, uint64_t lpn, bool write)
         return true;
     }
     bql_unlock();
-    qemu_mutex_lock(&s->lock);
-    QSIMPLEQ_INSERT_TAIL(&s->work, &work, next);
-    qemu_cond_broadcast(&s->wake);
-    while (!work.done) {
-        qemu_cond_wait(&s->wake, &s->lock);
-    }
-    qemu_mutex_unlock(&s->lock);
+    cxl_ftl(s, &work);
     bql_lock();
     s->media_ns += work.latency;
     op->ns += work.latency;
@@ -229,6 +263,15 @@ static MemTxResult cxl_access_locked(CXLType3Dev *ct3d, hwaddr hpa,
         return MEMTX_ERROR;
     }
     last = (dpa + size - 1) / 4096;
+    /* uffd owns the cache once installed; a late MMIO access only copies. */
+    if (femu_uffd_installed(&s->direct)) {
+        if (write) {
+            memcpy((uint8_t *)s->backend.logical_space + dpa, data, size);
+        } else {
+            memcpy(data, (uint8_t *)s->backend.logical_space + dpa, size);
+        }
+        return MEMTX_OK;
+    }
     /*
      * Hold the pages, in ascending order, so accesses to a page stay ordered
      * and a second miss to it waits for the first fill instead of repeating it.
@@ -274,7 +317,7 @@ static MemTxResult cxl_access_locked(CXLType3Dev *ct3d, hwaddr hpa,
         FemuCxlEntry *e = g_hash_table_lookup(s->cache.entries, &first);
 
         if (e && femu_cxl_der_map(&s->direct, hpa, dpa) &&
-            !s->direct.cylon) {
+            !s->direct.cylon && !s->direct.uffd) {
             /* Direct writes cannot update metadata, so charge on eviction. */
             e->dirty = true;
         }
@@ -377,8 +420,8 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
     uint64_t size;
 
     if (s->der && strcmp(s->der, "off") && strcmp(s->der, "memslot") &&
-        strcmp(s->der, "cylon")) {
-        error_setg(errp, "der must be off, memslot or cylon");
+        strcmp(s->der, "cylon") && strcmp(s->der, "uffd")) {
+        error_setg(errp, "der must be off, memslot, cylon or uffd");
         return;
     }
     if (s->der && !strcmp(s->der, "cylon") && !s->cylon_kernel_ack) {
@@ -450,6 +493,8 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
     s->stopping = false;
     qemu_thread_create(&s->worker, "femu-cxl-ftl", cxl_worker, s,
                        QEMU_THREAD_JOINABLE);
+    s->direct.media = cxl_uffd_media;
+    s->direct.media_opaque = s;
     femu_cxl_der_init(&s->direct, ct3d, s->der, &s->cache);
     s->closing = false;
     s->started = true;
@@ -504,6 +549,14 @@ static void cxl_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "der-revocations",
                                    &s->direct.revocations, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-faults", &s->direct.uffd_faults,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-wp-faults",
+                                   &s->direct.uffd_wp_faults,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-pending-victims",
+                                   &s->direct.uffd_pending_victims,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "der-fallbacks", &s->direct.fallbacks,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_bool(obj, "flush-cache", NULL, cxl_flush);

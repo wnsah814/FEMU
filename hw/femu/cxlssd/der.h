@@ -5,6 +5,7 @@
 #include "hw/cxl/cxl_device.h"
 #include "cache.h"
 #include "cylon.h"
+#include "uffd.h"
 
 typedef struct FemuCxlDer {
     CXLType3Dev *dev;
@@ -13,6 +14,14 @@ typedef struct FemuCxlDer {
     bool warned;
     bool cylon;
     FemuCylon *fast;
+    bool uffd;
+    FemuUffd *uffd_state;
+    /* uffd: charge one page of media time starting at @stime; returns ns */
+    int64_t (*media)(void *opaque, uint64_t lpn, bool write, int64_t stime);
+    void *media_opaque;
+    uint64_t uffd_faults;
+    uint64_t uffd_wp_faults;
+    uint64_t uffd_pending_victims;
     FemuCxlCache *cache;
     uint64_t remaps;
     uint64_t revocations;
