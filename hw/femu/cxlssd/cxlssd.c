@@ -438,6 +438,12 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
                    "reviewing the host dual-mode leaf lifetime fix");
         return;
     }
+    /* An MMIO miss in flight at install would insert behind the handler. */
+    if (s->der && !strcmp(s->der, "uffd") &&
+        s->concurrent == ON_OFF_AUTO_ON) {
+        error_setg(errp, "der=uffd requires concurrent-misses=auto or off");
+        return;
+    }
     if (!ct3d->hostvmem || ct3d->hostmem || ct3d->hostpmem ||
         ct3d->dc.num_regions || ct3d->dc.host_dc || ct3d->lsa) {
         error_setg(errp, "femu-cxl-ssd requires only volatile-memdev");
@@ -565,6 +571,9 @@ static void cxl_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-pending-victims",
                                    &s->direct.uffd_pending_victims,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-stop-faults",
+                                   &s->direct.uffd_stop_faults,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
                                    OBJ_PROP_FLAG_READ);

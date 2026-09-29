@@ -13854,6 +13854,41 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
     qtest_quit(qts);
 }
 
+/*
+ * der=uffd refuses what it cannot model: an MMIO miss still in flight when the
+ * handler takes the cache over, and a cache of no pages, whose faulted pages
+ * would stay mapped and never be charged again.
+ */
+static void femu_test_cxl_uffd_refuse(void *obj, void *data,
+                                      QGuestAllocator *alloc)
+{
+    const char *machine =
+        "-machine q35,cxl=on -m 128M "
+        "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 "
+        "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
+        "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on ";
+    QTestState *qts = qtest_init(machine);
+    QDict *rsp = qtest_qmp(qts, "{'execute':'device_add','arguments':{"
+                           "'driver':'femu-cxl-ssd','id':'ssd','bus':'rp0',"
+                           "'volatile-memdev':'mem','der':'uffd',"
+                           "'concurrent-misses':'on'}}");
+
+    g_assert_true(qdict_haskey(rsp, "error"));
+    g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                          "desc"), "concurrent-misses"));
+    qobject_unref(rsp);
+    qtest_quit(qts);
+
+    qts = qtest_initf("%s-device femu-cxl-ssd,id=ssd,bus=rp0,"
+                      "volatile-memdev=mem,der=uffd,cache-pages=0", machine);
+    femu_cxl_decode(qts);
+    qtest_writeq(qts, FEMU_CXL_WINDOW, 0x5a);
+    g_assert_false(femu_cxl_active(qts));
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW), ==, 0x5a);
+    qtest_quit(qts);
+}
+
 static void femu_test_cxl_no_ftl(void *obj, void *data,
                                  QGuestAllocator *alloc)
 {
@@ -13939,6 +13974,7 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-der-invalid", "femu", femu_test_cxl_der_invalid, NULL);
     qos_add_test("cxl-der", "femu", femu_test_cxl_der, NULL);
     qos_add_test("cxl-uffd", "femu", femu_test_cxl_uffd, NULL);
+    qos_add_test("cxl-uffd-refuse", "femu", femu_test_cxl_uffd_refuse, NULL);
     qos_add_test("cxl-wait-invalidate", "femu", femu_test_cxl_wait,
                  &(QOSGraphTestOptions) { .arg = (void *)2 });
     qos_add_test("cxl-wait", "femu", femu_test_cxl_wait, NULL);

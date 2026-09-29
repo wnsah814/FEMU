@@ -14,6 +14,8 @@
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
+#include "qemu/userfaultfd.h"
+#include "hw/cxl/cxl.h"
 #include "system/hostmem.h"
 #include "system/kvm.h"
 #include "der.h"
@@ -25,7 +27,6 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
-#include <sys/syscall.h>
 #include <sys/vfs.h>
 
 typedef struct UffdTimer {
@@ -51,6 +52,7 @@ struct FemuUffd {
     int64_t flush_ns;
     GHashTable *pending;        /* lpn -> UffdTimer, fills not yet resolved */
     GQueue timers;              /* the same, by due time */
+    GQueue deferred;            /* read fills waiting for a slot */
     int64_t evict_ns;           /* write-back time of the current miss */
     int64_t stime;
 };
@@ -77,11 +79,21 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
         fstatfs(fd, &fs) || fs.f_type != TMPFS_MAGIC) {
         return NULL;
     }
+    /* A page the cache cannot hold would stay mapped and never be charged. */
+    *reason = "uffd needs a cache (cache-pages > 0)";
+    if (!der->cache->nsets) {
+        return NULL;
+    }
     u = g_new0(FemuUffd, 1);
-    *reason = "userfaultfd for kernel faults needs CAP_SYS_PTRACE";
-    /* Without KVM (TCG, qtest) every fault is QEMU's own, in user mode. */
-    u->fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK |
-                    (kvm_enabled() ? 0 : UFFD_USER_MODE_ONLY));
+    /*
+     * Kernel-mode faults (KVM's) need access to /dev/userfaultfd, or else
+     * CAP_SYS_PTRACE or vm.unprivileged_userfaultfd for the system call.
+     * Without KVM (TCG, qtest) every fault is QEMU's own, in user mode.
+     */
+    *reason = "userfaultfd for kernel faults needs /dev/userfaultfd access "
+              "or CAP_SYS_PTRACE";
+    u->fd = uffd_open(O_CLOEXEC | O_NONBLOCK |
+                      (kvm_enabled() ? 0 : UFFD_USER_MODE_ONLY));
     if (u->fd < 0) {
         g_free(u);
         return NULL;
@@ -104,6 +116,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     qemu_cond_init(&u->flushed);
     u->pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     g_queue_init(&u->timers);
+    g_queue_init(&u->deferred);
     return u;
 }
 
@@ -116,14 +129,22 @@ static void uffd_continue(FemuUffd *u, uint64_t lpn)
 
     int64_t t = now_ns();
 
-    /* Another thread's fault on the page may have been resolved already. */
-    if (ioctl(u->fd, UFFDIO_CONTINUE, &c) && errno == EEXIST) {
+    /*
+     * Another thread's fault on the page may have been resolved already
+     * (EEXIST). On any other error, wake the waiters so they fault again
+     * rather than sleep for good.
+     */
+    if (ioctl(u->fd, UFFDIO_CONTINUE, &c)) {
         struct uffdio_range r = { (uintptr_t)u->host + lpn * 4096, 4096 };
 
+        if (errno != EEXIST) {
+            error_report_once("femu-cxl-uffd: UFFDIO_CONTINUE: %s",
+                              strerror(errno));
+        }
         ioctl(u->fd, UFFDIO_WAKE, &r);
     }
     u->der->uffd_ns_continue += now_ns() - t;
-    u->der->remaps++;
+    qatomic_inc(&u->der->remaps);
 }
 
 static bool uffd_evict(void *opaque, FemuCxlEntry *e)
@@ -139,7 +160,7 @@ static bool uffd_evict(void *opaque, FemuCxlEntry *e)
     /* Zap the guest's view; the data stays in the memfd's page cache. */
     madvise(u->host + e->lpn * 4096, 4096, MADV_DONTNEED);
     u->der->uffd_ns_zap += now_ns() - t;
-    u->der->revocations++;
+    qatomic_inc(&u->der->revocations);
     if (e->dirty) {
         t = now_ns();
         u->evict_ns += u->der->media(u->der->media_opaque, e->lpn, true,
@@ -156,11 +177,29 @@ static gint timer_cmp(gconstpointer a, gconstpointer b, gpointer unused)
     return x->due < y->due ? -1 : x->due > y->due;
 }
 
+/*
+ * Give a fill whose read is charged its cache slot, and schedule it after the
+ * read and the victim's write-back. A victim still being filled cannot be
+ * evicted, and a page mapped without a slot would never be zapped or charged
+ * again, so the fill waits until a fill resolves and frees a slot.
+ */
+static void uffd_place(FemuUffd *u, UffdTimer *t)
+{
+    u->stime = MAX(t->due, now_ns());
+    u->evict_ns = 0;
+    if (!femu_cxl_cache_insert(u->der->cache, t->lpn, uffd_evict, u)) {
+        g_queue_push_tail(&u->deferred, t);
+        return;
+    }
+    t->due = u->stime + u->evict_ns;
+    g_queue_insert_sorted(&u->timers, t, timer_cmp, NULL);
+}
+
 static void uffd_miss(FemuUffd *u, uint64_t lpn)
 {
     FemuCxlCache *cache = u->der->cache;
     UffdTimer *t;
-    int64_t read_ns;
+    int64_t stime;
 
     u->der->uffd_faults++;
     if (g_hash_table_contains(u->pending, &lpn)) {
@@ -171,21 +210,13 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn)
         return;
     }
     cache->misses++;
-    u->stime = now_ns();
-    read_ns = u->der->media(u->der->media_opaque, lpn, false, u->stime);
-    u->der->uffd_ns_ftl += now_ns() - u->stime;
-    u->evict_ns = 0;
-    u->stime += read_ns;
-    if (!femu_cxl_cache_insert(cache, lpn, uffd_evict, u)) {
-        /* The victim is still being filled: serve this page uncached. */
-        uffd_continue(u, lpn);
-        return;
-    }
+    stime = now_ns();
     t = g_new(UffdTimer, 1);
     t->lpn = lpn;
-    t->due = u->stime + u->evict_ns;
+    t->due = stime + u->der->media(u->der->media_opaque, lpn, false, stime);
+    u->der->uffd_ns_ftl += now_ns() - stime;
     g_hash_table_insert(u->pending, &t->lpn, t);
-    g_queue_insert_sorted(&u->timers, t, timer_cmp, NULL);
+    uffd_place(u, t);
 }
 
 static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
@@ -203,17 +234,30 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
     ioctl(u->fd, UFFDIO_WRITEPROTECT, &w);
 }
 
-/* Resolve fills whose media time has passed; with @all, every pending fill. */
+/*
+ * Resolve fills whose media time has passed; with @all, every pending fill.
+ * A deferred fill waits only for an in-cache fill, which is on the timer
+ * queue, so with @all both queues drain.
+ */
 static void uffd_fire(FemuUffd *u, bool all)
 {
     int64_t now = now_ns();
     UffdTimer *t;
+    bool freed;
+    guint n;
 
-    while ((t = g_queue_peek_head(&u->timers)) && (all || t->due <= now)) {
-        g_queue_pop_head(&u->timers);
-        uffd_continue(u, t->lpn);
-        g_hash_table_remove(u->pending, &t->lpn);
-    }
+    do {
+        freed = false;
+        while ((t = g_queue_peek_head(&u->timers)) && (all || t->due <= now)) {
+            g_queue_pop_head(&u->timers);
+            uffd_continue(u, t->lpn);
+            g_hash_table_remove(u->pending, &t->lpn);
+            freed = true;
+        }
+        for (n = freed ? u->deferred.length : 0; n; n--) {
+            uffd_place(u, g_queue_pop_head(&u->deferred));
+        }
+    } while (all && !g_queue_is_empty(&u->timers));
 }
 
 /* flush-cache: write back and zap every resident page, from the handler. */
@@ -245,6 +289,7 @@ static void *uffd_thread(void *opaque)
         UffdTimer *t = g_queue_peek_head(&u->timers);
         struct timespec ts, *tsp = NULL;
         int64_t busy;
+        uint64_t faults = 0;
         ssize_t n;
 
         if (t) {
@@ -254,11 +299,9 @@ static void *uffd_thread(void *opaque)
             ts.tv_nsec = wait % NANOSECONDS_PER_SECOND;
             tsp = &ts;
         }
-        if (ppoll(p, 3, tsp, NULL) < 0 && errno != EINTR) {
-            break;
-        }
-        if (p[1].revents) {
-            break;
+        /* On an error (EINTR) no revents are set; poll again. */
+        if (ppoll(p, 3, tsp, NULL) < 0) {
+            continue;
         }
         busy = now_ns();
         while ((n = read(u->fd, m, sizeof(m))) > 0) {
@@ -268,6 +311,7 @@ static void *uffd_thread(void *opaque)
                 if (m[i].event != UFFD_EVENT_PAGEFAULT) {
                     continue;
                 }
+                faults++;
                 lpn = (m[i].arg.pagefault.address - (uintptr_t)u->host) / 4096;
                 if (m[i].arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
                     uffd_wp_fault(u, lpn);
@@ -285,6 +329,11 @@ static void *uffd_thread(void *opaque)
         }
         uffd_fire(u, false);
         u->der->uffd_ns_busy += now_ns() - busy;
+        /* Stop only after taking the faults already queued. */
+        if (p[1].revents) {
+            u->der->uffd_stop_faults += faults;
+            break;
+        }
     }
     return NULL;
 }
@@ -292,6 +341,47 @@ static void *uffd_thread(void *opaque)
 bool femu_uffd_installed(FemuCxlDer *der)
 {
     return der->uffd_state && der->uffd_state->installed;
+}
+
+/*
+ * The alias maps window offset X to backend offset X, so HDM decoder 0 must
+ * be the only one committed, cover the whole window and skip no DPA.
+ */
+static bool uffd_identity(FemuUffd *u, CXLFixedWindow *fw)
+{
+    uint32_t *regs = u->der->dev->cxl_cstate.crb.cache_mem_registers;
+    uint64_t base, size, skip;
+    unsigned i;
+
+    for (i = 1; i < CXL_HDM_DECODER_COUNT; i++) {
+        if (FIELD_EX32(ldl_le_p(regs + R_CXL_HDM_DECODER0_CTRL + i * 8),
+                       CXL_HDM_DECODER0_CTRL, COMMITTED)) {
+            return false;
+        }
+    }
+    base = (uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_BASE_HI) << 32 |
+           (ldl_le_p(regs + R_CXL_HDM_DECODER0_BASE_LO) & 0xf0000000);
+    size = (uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_SIZE_HI) << 32 |
+           (ldl_le_p(regs + R_CXL_HDM_DECODER0_SIZE_LO) & 0xf0000000);
+    skip = (uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_DPA_SKIP_HI) << 32 |
+           (ldl_le_p(regs + R_CXL_HDM_DECODER0_DPA_SKIP_LO) & 0xf0000000);
+    return base == fw->base && size == fw->size && !skip;
+}
+
+/*
+ * UFFDIO_CONTINUE_MODE_WP (Linux 6.4) is not a feature bit: try it on page 0,
+ * which the backend preallocated, and zap the page again.
+ */
+static bool uffd_continue_wp(FemuUffd *u)
+{
+    struct uffdio_continue c = {
+        .range = { (uintptr_t)u->host, 4096 },
+        .mode = UFFDIO_CONTINUE_MODE_WP,
+    };
+    bool ok = !ioctl(u->fd, UFFDIO_CONTINUE, &c) || errno == EEXIST;
+
+    madvise(u->host, 4096, MADV_DONTNEED);
+    return ok;
 }
 
 /*
@@ -307,18 +397,29 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw)
         .range = { (uintptr_t)u->host, u->size },
         .mode = UFFDIO_REGISTER_MODE_MINOR | UFFDIO_REGISTER_MODE_WP,
     };
+    const uint64_t ioctls = BIT_ULL(_UFFDIO_CONTINUE) |
+                            BIT_ULL(_UFFDIO_WRITEPROTECT);
 
     if (u->installed) {
         return true;
     }
-    if (fw->size != u->size || (u->container && u->container != &fw->mr)) {
-        femu_cxl_der_fallback(der, "uffd maps one whole window onto the backend");
+    if (fw->size != u->size || (u->container && u->container != &fw->mr) ||
+        !uffd_identity(u, fw)) {
+        femu_cxl_der_fallback(der, "uffd maps one whole window onto the "
+                              "backend, through one decoder with no skip");
         femu_uffd_destroy(der);
         return false;
     }
     if (madvise(u->host, u->size, MADV_DONTNEED) ||
-        ioctl(u->fd, UFFDIO_REGISTER, &reg)) {
+        ioctl(u->fd, UFFDIO_REGISTER, &reg) ||
+        (reg.ioctls & ioctls) != ioctls) {
         femu_cxl_der_fallback(der, "uffd registration failed");
+        femu_uffd_destroy(der);
+        return false;
+    }
+    if (!uffd_continue_wp(u)) {
+        femu_cxl_der_fallback(der, "the kernel lacks UFFDIO_CONTINUE_MODE_WP "
+                              "(Linux 6.4)");
         femu_uffd_destroy(der);
         return false;
     }
@@ -334,7 +435,7 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw)
     }
     u->installed = true;
     der->available = true;
-    der->remaps++;
+    qatomic_inc(&der->remaps);
     return true;
 }
 
@@ -359,13 +460,19 @@ void femu_uffd_uninstall(FemuCxlDer *der)
         error_report("femu-cxl-uffd: cannot rearm the handler");
     }
     uffd_fire(u, true);
-    /* Unregistering also wakes any fault still waiting on the range. */
+    /*
+     * Unregistering wakes waiters only for missing-mode ranges, and a fault
+     * that arrived after the handler's last read is still waiting. Wake the
+     * range, which needs no registration, before a vCPU sleeping in a fault
+     * blocks the memslot removal below.
+     */
     r = (struct uffdio_range) { (uintptr_t)u->host, u->size };
     ioctl(u->fd, UFFDIO_UNREGISTER, &r);
+    ioctl(u->fd, UFFDIO_WAKE, &r);
     memory_region_set_enabled(&u->alias, false);
     u->installed = false;
     der->available = false;
-    der->revocations++;
+    qatomic_inc(&der->revocations);
 }
 
 bool femu_uffd_flush(FemuCxlDer *der, uint64_t *ns)
@@ -404,7 +511,8 @@ void femu_uffd_destroy(FemuCxlDer *der)
     close(u->cmd);
     qemu_cond_destroy(&u->flushed);
     qemu_mutex_destroy(&u->lock);
-    g_queue_clear_full(&u->timers, NULL);
+    g_queue_clear(&u->timers);
+    g_queue_clear(&u->deferred);
     g_hash_table_destroy(u->pending);
     g_free(u);
     der->uffd_state = NULL;

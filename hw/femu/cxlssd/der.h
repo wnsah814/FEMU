@@ -22,6 +22,7 @@ typedef struct FemuCxlDer {
     uint64_t uffd_faults;
     uint64_t uffd_wp_faults;
     uint64_t uffd_pending_victims;
+    uint64_t uffd_stop_faults;  /* faults taken after a stop request */
     /* handler time, ns: FTL calls, victim zaps, continues, and all work */
     uint64_t uffd_ns_ftl;
     uint64_t uffd_ns_zap;
