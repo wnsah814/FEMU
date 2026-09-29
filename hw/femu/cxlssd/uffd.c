@@ -30,10 +30,11 @@
 #include <sys/vfs.h>
 
 /*
- * A resolved fill pins its page until the thread that faulted on it faults
- * elsewhere, which it does only after making its access, or at most this long.
- * Unpinned, a policy that evicts the newest entry (LIFO) zaps each page right
- * after its CONTINUE, and the waiters fault on it again and again.
+ * A resolved fill pins its page until the thread that faulted on it faults on
+ * another page, or at most this long, so a later fill cannot zap the page
+ * before the woken thread gets to it. The pin covers only the page the thread
+ * waited for: an instruction that needs several pages keeps the earlier ones
+ * because the policy evicts older entries first (see femu_uffd_prepare()).
  */
 #define UFFD_PIN_NS 1000000
 
@@ -96,6 +97,19 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
     /* A page the cache cannot hold would stay mapped and never be charged. */
     *reason = "uffd needs a cache (cache-pages > 0)";
     if (!der->cache->nsets) {
+        return NULL;
+    }
+    /*
+     * One instruction may need several pages mapped at once: a string copy
+     * between CXL buffers, an access across a page boundary, code or page
+     * tables on the device. Filling the last must not evict the others, as
+     * LIFO does (its victim is the newest entry) and a small set does when
+     * they share it; the instruction would fault on them in turn forever.
+     * Four ways cover code, source, destination and a page-table page: a
+     * rule of thumb, not a bound.
+     */
+    *reason = "uffd needs cache-policy other than lifo and cache-ways >= 4";
+    if (der->cache->policy == FEMU_CXL_LIFO || der->cache->ways < 4) {
         return NULL;
     }
     u = g_new0(FemuUffd, 1);

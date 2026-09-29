@@ -13856,8 +13856,10 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
 
 /*
  * der=uffd refuses what it cannot model: an MMIO miss still in flight when the
- * handler takes the cache over, and a cache of no pages, whose faulted pages
- * would stay mapped and never be charged again.
+ * handler takes the cache over; a cache of no pages, whose faulted pages would
+ * stay mapped and never be charged again; and a cache that would evict a page
+ * an instruction still needs while it fills the next (LIFO, or under 4 ways).
+ * The device then stays on MMIO.
  */
 static void femu_test_cxl_uffd_refuse(void *obj, void *data,
                                       QGuestAllocator *alloc)
@@ -13868,11 +13870,15 @@ static void femu_test_cxl_uffd_refuse(void *obj, void *data,
         "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
         "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
         "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on ";
+    const char *refused[] = {
+        "cache-pages=0", "cache-policy=lifo", "cache-pages=16,cache-ways=2",
+    };
     QTestState *qts = qtest_init(machine);
     QDict *rsp = qtest_qmp(qts, "{'execute':'device_add','arguments':{"
                            "'driver':'femu-cxl-ssd','id':'ssd','bus':'rp0',"
                            "'volatile-memdev':'mem','der':'uffd',"
                            "'concurrent-misses':'on'}}");
+    size_t i;
 
     g_assert_true(qdict_haskey(rsp, "error"));
     g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
@@ -13880,13 +13886,17 @@ static void femu_test_cxl_uffd_refuse(void *obj, void *data,
     qobject_unref(rsp);
     qtest_quit(qts);
 
-    qts = qtest_initf("%s-device femu-cxl-ssd,id=ssd,bus=rp0,"
-                      "volatile-memdev=mem,der=uffd,cache-pages=0", machine);
-    femu_cxl_decode(qts);
-    qtest_writeq(qts, FEMU_CXL_WINDOW, 0x5a);
-    g_assert_false(femu_cxl_active(qts));
-    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW), ==, 0x5a);
-    qtest_quit(qts);
+    for (i = 0; i < ARRAY_SIZE(refused); i++) {
+        qts = qtest_initf("%s-device femu-cxl-ssd,id=ssd,bus=rp0,"
+                          "volatile-memdev=mem,der=uffd,%s", machine,
+                          refused[i]);
+        g_assert_cmpuint(femu_cxl_stat(qts, "der-fallbacks"), ==, 1);
+        femu_cxl_decode(qts);
+        qtest_writeq(qts, FEMU_CXL_WINDOW, 0x5a);
+        g_assert_false(femu_cxl_active(qts));
+        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW), ==, 0x5a);
+        qtest_quit(qts);
+    }
 }
 
 static void femu_test_cxl_no_ftl(void *obj, void *data,
