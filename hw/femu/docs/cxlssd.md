@@ -23,6 +23,17 @@ access waits for the returned media completion cost using a sleep, not a busy
 loop. This is volatile memory, not a persistence contract for guest CPU cache
 flush instructions.
 
+Guest atomic instructions are not atomic on an access that exits to QEMU,
+which is every access with `der=off`, the default, and the first access to a
+page in the direct modes. KVM emulates a `lock`-prefixed read-modify-write on
+MMIO as a read exit followed by a separate write exit (a compare-and-exchange
+becomes a plain write), and the operation gate is taken for each exit, so
+another vCPU's access to the same address can land between the two. With four
+vCPUs adding to one counter per page with `lock add` and `der=off`, 0.25% to
+1.6% of the increments were lost, with or without cache misses; none were lost
+on guest DRAM or, in the same runs, with `der=memslot`. Locks, reference counts
+and lock-free structures therefore do not belong in the window with `der=off`.
+
 `ssd_init()`, `bb_ftl_process_req()`, `ssd_free()` and the shared NAND media are
 reused directly. There is no renamed copy of the old FTL. Master supplies
 mapping, allocation, GC, media accounting, and its current timing fixes. The
@@ -92,8 +103,20 @@ Both direct modes require non-interleaved pages in a single-target CXL window,
 with the endpoint directly below a root port on a host bridge without HDM
 decoding. Memslot pressure leaves additional pages on MMIO without reducing
 cache capacity. Every memslot-mapped entry is conservatively dirty because
-alias writes cannot notify cache metadata. Direct hits in either mode do not
+alias writes cannot notify cache metadata, so each eviction of one is a NAND
+program even under a read-only workload. Direct hits in either mode do not
 update CLOCK/S3-FIFO reference metadata or MMIO hit counters.
+
+Each memslot-mapped page is its own alias region and KVM memory slot. Mapping
+or unmapping one commits a memory transaction, which rebuilds the flat view and
+inserts every alias into a sorted array, so the cost of a miss grows with the
+square of the number of mapped pages. With a 4096-page cache, a 1 GiB window
+and one thread reading never-written pages, a miss took 19 us with `der=off`.
+With `der=memslot` it took 16 ms while 1,800 to 2,500 pages were mapped, 39 ms
+at 3,700 to 3,900, and 86 ms once all 4096 were (a miss then maps one page and
+unmaps another); 92% of it was `memmove()` under `flatview_insert()` (Xeon
+E5-2699 v3). Memslot mode pays off only when a mapped page is hit many times
+between misses.
 
 ### Cylon interface and memory ownership
 
