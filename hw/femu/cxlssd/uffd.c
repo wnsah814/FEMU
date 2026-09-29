@@ -101,12 +101,15 @@ static void uffd_continue(FemuUffd *u, uint64_t lpn)
         .mode = UFFDIO_CONTINUE_MODE_WP,
     };
 
+    int64_t t = now_ns();
+
     /* Another thread's fault on the page may have been resolved already. */
     if (ioctl(u->fd, UFFDIO_CONTINUE, &c) && errno == EEXIST) {
         struct uffdio_range r = { (uintptr_t)u->host + lpn * 4096, 4096 };
 
         ioctl(u->fd, UFFDIO_WAKE, &r);
     }
+    u->der->uffd_ns_continue += now_ns() - t;
     u->der->remaps++;
 }
 
@@ -118,12 +121,17 @@ static bool uffd_evict(void *opaque, FemuCxlEntry *e)
         u->der->uffd_pending_victims++;
         return false;
     }
+    int64_t t = now_ns();
+
     /* Zap the guest's view; the data stays in the memfd's page cache. */
     madvise(u->host + e->lpn * 4096, 4096, MADV_DONTNEED);
+    u->der->uffd_ns_zap += now_ns() - t;
     u->der->revocations++;
     if (e->dirty) {
+        t = now_ns();
         u->evict_ns += u->der->media(u->der->media_opaque, e->lpn, true,
                                      u->stime + u->evict_ns);
+        u->der->uffd_ns_ftl += now_ns() - t;
     }
     return true;
 }
@@ -152,6 +160,7 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn)
     cache->misses++;
     u->stime = now_ns();
     read_ns = u->der->media(u->der->media_opaque, lpn, false, u->stime);
+    u->der->uffd_ns_ftl += now_ns() - u->stime;
     u->evict_ns = 0;
     u->stime += read_ns;
     if (!femu_cxl_cache_insert(cache, lpn, uffd_evict, u)) {
@@ -202,6 +211,7 @@ static void *uffd_thread(void *opaque)
         struct pollfd p[2] = { { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 } };
         UffdTimer *t = g_queue_peek_head(&u->timers);
         struct timespec ts, *tsp = NULL;
+        int64_t busy;
         ssize_t n;
 
         if (t) {
@@ -217,6 +227,7 @@ static void *uffd_thread(void *opaque)
         if (p[1].revents) {
             break;
         }
+        busy = now_ns();
         while ((n = read(u->fd, m, sizeof(m))) > 0) {
             for (size_t i = 0; i < n / sizeof(m[0]); i++) {
                 uint64_t lpn;
@@ -233,6 +244,7 @@ static void *uffd_thread(void *opaque)
             }
         }
         uffd_fire(u);
+        u->der->uffd_ns_busy += now_ns() - busy;
     }
     return NULL;
 }

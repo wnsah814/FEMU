@@ -176,7 +176,13 @@ static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
     if (!s->ftl) {
         return 0;
     }
-    cxl_ftl(s, &work);
+    /*
+     * The worker calls the FTL under s->lock too, so taking it here keeps the
+     * FTL single-threaded without two context switches through the worker.
+     */
+    qemu_mutex_lock(&s->lock);
+    work.latency = bb_ftl_process_req(s->ctrl, &s->ns, &work.req);
+    qemu_mutex_unlock(&s->lock);
     qatomic_add(&s->media_ns, work.latency);
     if (write) {
         qatomic_inc(&s->media_writes);
@@ -556,6 +562,15 @@ static void cxl_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-pending-victims",
                                    &s->direct.uffd_pending_victims,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-continue",
+                                   &s->direct.uffd_ns_continue,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-busy", &s->direct.uffd_ns_busy,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "der-fallbacks", &s->direct.fallbacks,
                                    OBJ_PROP_FLAG_READ);
