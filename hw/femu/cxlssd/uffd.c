@@ -11,7 +11,6 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
-#include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qemu/userfaultfd.h"
@@ -34,7 +33,7 @@
  * another page, or at most this long, so a later fill cannot zap the page
  * before the woken thread gets to it. The pin covers only the page the thread
  * waited for: an instruction that needs several pages keeps the earlier ones
- * because the policy evicts older entries first (see femu_uffd_prepare()).
+ * only if filling the next does not evict them (see femu_uffd_prepare()).
  */
 #define UFFD_PIN_NS 1000000
 
@@ -126,7 +125,8 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, const char **reason)
         g_free(u);
         return NULL;
     }
-    *reason = "the kernel lacks shmem minor faults or shmem write-protect";
+    *reason = "the kernel lacks shmem minor faults, shmem write-protect "
+              "or fault thread ids";
     if (ioctl(u->fd, UFFDIO_API, &api) ||
         (api.features & features) != features) {
         close(u->fd);

@@ -146,32 +146,19 @@ static void *cxl_worker(void *opaque)
     return NULL;
 }
 
-/* Queue one request for the FTL worker and wait for it; needs no BQL. */
-static void cxl_ftl(FemuCxlSsd *s, FemuCxlWork *work)
-{
-    qemu_mutex_lock(&s->lock);
-    QSIMPLEQ_INSERT_TAIL(&s->work, work, next);
-    qemu_cond_broadcast(&s->wake);
-    while (!work->done) {
-        qemu_cond_wait(&s->wake, &s->lock);
-    }
-    qemu_mutex_unlock(&s->lock);
-}
-
 /* der=uffd: the fault handler's media access, outside the BQL. */
 static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
                               int64_t stime)
 {
     FemuCxlSsd *s = opaque;
-    FemuCxlWork work = {
-        .req = {
-            .cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ,
-            .ns = &s->ns,
-            .slba = lpn * 8,
-            .nlb = 8,
-            .stime = stime,
-        },
+    NvmeRequest req = {
+        .cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ,
+        .ns = &s->ns,
+        .slba = lpn * 8,
+        .nlb = 8,
+        .stime = stime,
     };
+    int64_t latency;
 
     if (!s->ftl) {
         return 0;
@@ -181,7 +168,7 @@ static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
      * FTL single-threaded without two context switches through the worker.
      */
     qemu_mutex_lock(&s->lock);
-    work.latency = bb_ftl_process_req(s->ctrl, &s->ns, &work.req);
+    latency = bb_ftl_process_req(s->ctrl, &s->ns, &req);
     /* NAND pages programmed, GC included, as the MMIO path counts them. */
     if (write) {
         qatomic_set(&s->media_writes, ssd_nand_write_pages(s->ns.ssd));
@@ -189,8 +176,8 @@ static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
         qatomic_inc(&s->media_reads);
     }
     qemu_mutex_unlock(&s->lock);
-    qatomic_add(&s->media_ns, work.latency);
-    return work.latency;
+    qatomic_add(&s->media_ns, latency);
+    return latency;
 }
 
 /*
@@ -214,7 +201,13 @@ static bool cxl_media(FemuCxlOp *op, uint64_t lpn, bool write)
         return true;
     }
     bql_unlock();
-    cxl_ftl(s, &work);
+    qemu_mutex_lock(&s->lock);
+    QSIMPLEQ_INSERT_TAIL(&s->work, &work, next);
+    qemu_cond_broadcast(&s->wake);
+    while (!work.done) {
+        qemu_cond_wait(&s->wake, &s->lock);
+    }
+    qemu_mutex_unlock(&s->lock);
     bql_lock();
     s->media_ns += work.latency;
     op->ns += work.latency;
