@@ -182,13 +182,14 @@ static int64_t cxl_uffd_media(void *opaque, uint64_t lpn, bool write,
      */
     qemu_mutex_lock(&s->lock);
     work.latency = bb_ftl_process_req(s->ctrl, &s->ns, &work.req);
-    qemu_mutex_unlock(&s->lock);
-    qatomic_add(&s->media_ns, work.latency);
+    /* NAND pages programmed, GC included, as the MMIO path counts them. */
     if (write) {
-        qatomic_inc(&s->media_writes);
+        qatomic_set(&s->media_writes, ssd_nand_write_pages(s->ns.ssd));
     } else {
         qatomic_inc(&s->media_reads);
     }
+    qemu_mutex_unlock(&s->lock);
+    qatomic_add(&s->media_ns, work.latency);
     return work.latency;
 }
 
