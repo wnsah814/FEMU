@@ -24,4 +24,4 @@ system_ss.add(when: ['CONFIG_FEMU_PCI', 'CONFIG_CXL_MEM_DEVICE'],
                              'cxlssd/cca.c', 'cxlssd/cca-ring.c',
                              'cxlssd/props.c'))
 specific_ss.add(when: ['CONFIG_FEMU_PCI', 'CONFIG_CXL_MEM_DEVICE'],
-                if_true: files('cxlssd/qemu-adapter.c'))
+                if_true: files('cxlssd/qemu-adapter.c', 'cxlssd/uffd.c'))

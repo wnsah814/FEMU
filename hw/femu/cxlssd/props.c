@@ -54,8 +54,9 @@ static const FemuPropDesc cxl_descs[] = {
     /* direct endpoint remapping */
     { "der",
       "Direct mapping of cached pages into the guest: off (MMIO only, the "
-      "default), memslot (KVM memory slot aliases, not under TCG) or "
-      "cylon (a Cylon host kernel)" },
+      "default), memslot (KVM memory slot aliases, not under TCG), "
+      "cylon (a Cylon host kernel) or uffd (userfaultfd on a shared memfd "
+      "backend, Linux 6.4)" },
     { "der-replace-rate",
       "With der=memslot and no free alias (1024 shared by all devices, "
       "fewer if KVM has fewer free slots), the most aliases per second a "
@@ -195,7 +196,8 @@ static const FemuPropDesc cxl_runtime_descs[] = {
     { "der-active",
       "Read-only: whether direct mapping is available on this device" },
     { "der-probes",
-      "Read-only: probe attempts, one per realize with der=cylon" },
+      "Read-only: probe attempts, one per realize with der=cylon or "
+      "der=uffd" },
     { "der-mapped",
       "Read-only gauge: pages currently mapped for direct guest access" },
     { "der-remaps",
@@ -207,6 +209,28 @@ static const FemuPropDesc cxl_runtime_descs[] = {
       "clear, done without a TLB flush" },
     { "der-replacements",
       "Read-only: memslot aliases displaced by a hotter page" },
+    { "uffd-faults",
+      "Read-only event counter: missing-page faults the der=uffd handler "
+      "took" },
+    { "uffd-wp-faults",
+      "Read-only event counter: first-write faults the der=uffd handler "
+      "took, each marking a resident page dirty" },
+    { "uffd-pending-victims",
+      "Read-only event counter: der=uffd evictions refused because the "
+      "victim was being filled or pinned for the thread that faulted" },
+    { "uffd-stop-faults",
+      "Read-only event counter: faults the der=uffd handler took after it "
+      "was asked to stop" },
+    { "uffd-ns-ftl",
+      "Read-only: time in ns the der=uffd handler spent in FTL calls" },
+    { "uffd-ns-zap",
+      "Read-only: time in ns the der=uffd handler spent zapping victims" },
+    { "uffd-ns-continue",
+      "Read-only: time in ns the der=uffd handler spent in "
+      "UFFDIO_CONTINUE" },
+    { "uffd-ns-busy",
+      "Read-only: time in ns the der=uffd handler spent awake, all work "
+      "included" },
     { "der-fallbacks",
       "Read-only: refused direct mapping attempts and device "
       "disablements" },

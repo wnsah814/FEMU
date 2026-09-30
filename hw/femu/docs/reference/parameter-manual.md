@@ -545,7 +545,7 @@ Design: [CXL SSD](../design/cxl-ssd.md).
 | `pages-per-block`, `blocks-per-plane` | count | 1 to 65536; blocks 2 to 65536, or 0 to size it | NAND blocks; 0 leaves spare room for GC |
 | `read-ns`, `program-ns`, `erase-ns`, `channel-ns` | ns | at most one second | NAND times |
 | `gc-threshold`, `gc-threshold-high` | percent | 1 to 100, high >= low | GC watermarks |
-| `der` | name | `off`, `memslot`, `cylon` | direct mapping of cached pages into the guest |
+| `der` | name | `off`, `memslot`, `cylon`, `uffd` | direct mapping of cached pages into the guest; `uffd` needs a shared, preallocated memfd backend |
 | `der-replace-rate` | per second | 0 disables | `memslot` alias replacements a hot page may cause |
 | `cylon-kernel-ack` | bool | must be on with `der=cylon` | states that the host runs a fixed Cylon kernel |
 | `concurrent-misses` | on, off, auto | | misses to different pages wait for the media together |

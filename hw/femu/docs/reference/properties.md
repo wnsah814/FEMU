@@ -263,7 +263,7 @@ QEMU's internal compatibility properties (`x-max-bounce-buffer-size`, `x-pcie-ar
 
 ## `femu-cxl-ssd`: CXL Type-3 SSD
 
-`-device femu-cxl-ssd` has 24 properties of its own, 10 inherited from `cxl-type3` and 50 QOM properties listed in [runtime-properties.md](runtime-properties.md).
+`-device femu-cxl-ssd` has 24 properties of its own, 10 inherited from `cxl-type3` and 58 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Cache
 
@@ -294,7 +294,7 @@ QEMU's internal compatibility properties (`x-max-bounce-buffer-size`, `x-pcie-ar
 
 | Property | Type | Default | Description |
 | --- | --- | --- | --- |
-| `der` | `str` | unset | Direct mapping of cached pages into the guest: off (MMIO only, the default), memslot (KVM memory slot aliases, not under TCG) or cylon (a Cylon host kernel) |
+| `der` | `str` | unset | Direct mapping of cached pages into the guest: off (MMIO only, the default), memslot (KVM memory slot aliases, not under TCG), cylon (a Cylon host kernel) or uffd (userfaultfd on a shared memfd backend, Linux 6.4) |
 | `der-replace-rate` | `uint32` | `64` | With der=memslot and no free alias (1024 shared by all devices, fewer if KVM has fewer free slots), the most aliases per second a repeatedly missing page may displace; 0 disables replacement |
 | `cylon-kernel-ack` | `bool` | `off` | Must be on with der=cylon to state that the host runs a Cylon kernel with the dual-slot fixes; the device does not check it |
 | `concurrent-misses` | `OnOffAuto` | `auto` | Let misses to different pages wait for the media together; auto does so only while direct mapping is active |
