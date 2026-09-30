@@ -185,6 +185,34 @@ entry is conservatively dirty because alias writes cannot notify cache
 metadata; Cylon samples EPT dirty bits instead. Direct hits in either mode do
 not update CLOCK/S3-FIFO reference metadata or MMIO hit counters.
 
+### userfaultfd mapping
+
+`der=uffd` is a prototype. The first decoded access maps the whole window as one
+alias of the backend, which must be a shared, preallocated
+`memory-backend-memfd`, and registers it with userfaultfd for minor faults and
+write protection. A page outside the cache is zapped from the backend's page
+tables (`MADV_DONTNEED`), so touching it raises a minor fault; a handler thread
+charges the miss to the FTL and resolves the fault with `UFFDIO_CONTINUE` once
+the media time has passed, write-protected, so the first write of each residency
+marks the page dirty. Hits never leave the hardware. A resolved fill stays
+pinned until the thread that faulted on it faults on another page (or 1 ms), and
+a fill whose victim is pinned or still being filled waits for a slot.
+
+The handler owns the cache while the window is mapped; MMIO accesses that still
+arrive only copy. So that no MMIO miss is still filling the cache when the
+handler takes it over, only an access with no other in progress maps the window
+(with `concurrent-misses=on`, or under `auto` just after the window is
+unmapped). Invalidation, flush, a way change and anything else that
+clears direct mappings stop the handler and hand the cache back to the MMIO
+path; the next access maps the window again. The mode needs Linux 6.4
+(`UFFDIO_CONTINUE_MODE_WP`), access to `/dev/userfaultfd` or `CAP_SYS_PTRACE`
+under KVM, and a window that decodes linearly onto the device from DPA zero. The
+guest should pass HLT through (`-overcommit cpu-pm=on`) and turn off PV async
+page faults, or KVM's async-PF worker faults every page in for write. It refuses,
+and stays on MMIO, with no cache, `cache-policy=lifo`, fewer than 4 ways (one
+instruction may need several pages mapped at once), and `cca=on`; a direct
+ratio and a linked NVMe controller are refused outright. It does not prefetch.
+
 ### Memslot mapping limit
 
 Memslot mode maps at most 1024 pages at once as one-page aliases (4 MiB),

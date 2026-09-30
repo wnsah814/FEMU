@@ -14,6 +14,7 @@
 #include "../bbssd/ftl.h"
 #include "cache.h"
 #include "qemu-adapter.h"
+#include "uffd.h"
 
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
@@ -1255,8 +1256,8 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
     uint64_t size;
 
     if (s->der && strcmp(s->der, "off") && strcmp(s->der, "memslot") &&
-        strcmp(s->der, "cylon")) {
-        error_setg(errp, "der must be off, memslot or cylon");
+        strcmp(s->der, "cylon") && strcmp(s->der, "uffd")) {
+        error_setg(errp, "der must be off, memslot, cylon or uffd");
         return;
     }
     /*
@@ -1548,6 +1549,26 @@ static void cxl_init(Object *obj)
     object_property_add_uint64_ptr(obj, "der-quiet-revocations",
                                    &s->direct.quiet_revocations,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-faults", &s->direct.uffd_faults,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-wp-faults",
+                                   &s->direct.uffd_wp_faults,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-pending-victims",
+                                   &s->direct.uffd_pending_victims,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-stop-faults",
+                                   &s->direct.uffd_stop_faults,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-continue",
+                                   &s->direct.uffd_ns_continue,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-ns-busy", &s->direct.uffd_ns_busy,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "der-fallbacks", &s->direct.fallbacks,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "der-replacements",
@@ -1694,6 +1715,11 @@ static bool cxl_nvme_prepare(FemuCtrl *n, Error **errp)
         error_setg(errp, "cxl_ssd requires the femu-cxl-ssd to have ftl=on");
         return false;
     }
+    /* Its writes drop cache pages that the uffd handler owns. */
+    if (s->direct.uffd) {
+        error_setg(errp, "cxl_ssd cannot share a femu-cxl-ssd with der=uffd");
+        return false;
+    }
     if (s->nvme) {
         error_setg(errp, "the femu-cxl-ssd already serves an NVMe controller");
         return false;
@@ -1809,7 +1835,19 @@ void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
     der->windows = g_ptr_array_new();
     g_queue_init(&der->installed);
     der->cylon = mode && !strcmp(mode, "cylon");
-    if (der->cylon) {
+    der->uffd = mode && !strcmp(mode, "uffd");
+    if (der->uffd) {
+        der->probes++;
+        /* CCA commands change the cache from another thread. */
+        reason = "uffd cannot follow CCA commands";
+        if (!dev->media.cca_enabled) {
+            der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
+                                                &reason);
+        }
+        if (!der->uffd_state) {
+            femu_cxl_der_fallback(der, reason);
+        }
+    } else if (der->cylon) {
         der->probes++;
         der->fast = femu_cylon_prepare(der, &reason);
         if (!der->fast) {
@@ -1989,6 +2027,16 @@ static void der_displace(FemuCxlDer *der, FemuCxlMap *victim, FemuCxlEntry *e)
     der->replacements++;
 }
 
+/* Whether @fw decodes linearly onto this device's DPA from zero. */
+static bool der_linear(FemuCxlDer *der, CXLFixedWindow *fw)
+{
+#ifdef CONFIG_KVM
+    return adapter_linear(&der->dev->parent_obj, fw->base, fw->size);
+#else
+    return false;
+#endif
+}
+
 bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
                       FemuCxlEntry *e)
 {
@@ -1998,6 +2046,19 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
     CXLFixedWindow *fw;
     uint64_t check;
 
+    /*
+     * uffd maps the whole window at once, from a demand access (@e set): a
+     * prefetch must not start the handler while its access still inserts.
+     * The alias maps window offset X to backend offset X.
+     */
+    if (der->uffd) {
+        fw = e && der->uffd_state ? der_window(der, hpa) : NULL;
+        if (fw && !der_linear(der, fw)) {
+            der->fallbacks++;
+            return false;
+        }
+        return fw && femu_uffd_map(der, fw, OBJECT(der->dev));
+    }
     /* As in Cylon, a ratio adds to cached mappings instead of limiting them. */
     if ((!der->available && !der->fast) || (hpa & 4095) != (dpa & 4095)) {
         return false;
@@ -2174,7 +2235,8 @@ static void cxl_ratio(FemuCxlSsd *dev, uint64_t ratio, Error **errp)
         error_setg(errp, "unsupported Cylon direct ratio");
         return;
     }
-    if (ratio && (!s->der || !strcmp(s->der, "off"))) {
+    if (ratio && (!s->der || !strcmp(s->der, "off") ||
+                  !strcmp(s->der, "uffd"))) {
         error_setg(errp, "a direct ratio requires der=memslot or der=cylon");
         return;
     }
@@ -2211,6 +2273,15 @@ void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn)
 {
     FemuCxlMap *map = g_hash_table_lookup(der->maps, &lpn);
 
+    /*
+     * Only the MMIO path evicts pages here, and it owns the cache only while
+     * uffd is not mapped, when uffd maps nothing. The callers that drop single
+     * pages from elsewhere (CCA, a linked NVMe controller) are refused.
+     */
+    if (der->uffd) {
+        return;
+    }
+
     if (der->cylon) {
         femu_cylon_remove(der, lpn);
         return;
@@ -2246,6 +2317,12 @@ void femu_cxl_der_clear(FemuCxlDer *der)
     GHashTableIter it;
     gpointer key;
 
+    /* Stop the handler and hand the cache back to the MMIO path. */
+    if (der->uffd) {
+        femu_uffd_uninstall(der);
+        return;
+    }
+
     if (der->cylon) {
         femu_cylon_clear(der);
         return;
@@ -2267,10 +2344,12 @@ void femu_cxl_der_disable(FemuCxlDer *der)
     der->available = false;
     /* Unlock the backing now; a new device may reuse and lock it. */
     femu_cylon_destroy(der);
+    femu_uffd_destroy(der);
 }
 
 void femu_cxl_der_destroy(FemuCxlDer *der)
 {
+    femu_uffd_destroy(der);
     femu_cxl_der_clear(der);
     femu_cylon_destroy(der);
     der->available = false;

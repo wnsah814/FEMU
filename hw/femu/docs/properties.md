@@ -266,7 +266,7 @@ with `qom-set`.
 | `channel-ns` | uint64 | 0 | Channel transfer time per page; same range. |
 | `cylon-first-touch-program` | bool | off | Charge a NAND program instead of a free read when a read reaches a page the FTL has never mapped, as in Cylon's experiments. The program maps the page and counts in `media-writes`, not `media-reads`. |
 | `cylon-free-writeback` | bool | off | Write dirty pages back on eviction and flush with no NAND program and no media time, as in Cylon's experiments. |
-| `der` | string | off | `off`: MMIO without probes. `memslot`: QEMU aliases using ordinary KVM; refused under TCG. `cylon`: published mapped-SPT interface, requiring shared preallocated hugetlb backing, locking and readable PFNs; unsupported hosts warn once and retain MMIO. Other values fail realize. The direct modes map pages only for a single endpoint directly below the one root port of a host bridge without HDM decoders, in a single-target window, with non-interleaved endpoint decoders; elsewhere they stay on MMIO and count `der-fallbacks`. See `cxlssd.md` for kernel restrictions. |
+| `der` | string | off | `off`: MMIO without probes. `memslot`: QEMU aliases using ordinary KVM; refused under TCG. `cylon`: published mapped-SPT interface, requiring shared preallocated hugetlb backing, locking and readable PFNs; unsupported hosts warn once and retain MMIO. `uffd`: the whole window as one alias of a shared, preallocated memfd, with misses taken as userfaultfd faults (prototype; see "userfaultfd mapping" in `cxlssd.md`). Other values fail realize. The direct modes map pages only for a single endpoint directly below the one root port of a host bridge without HDM decoders, in a single-target window, with non-interleaved endpoint decoders; elsewhere they stay on MMIO and count `der-fallbacks`. See `cxlssd.md` for kernel restrictions. |
 | `cylon-kernel-ack` | bool | off | Required with `der=cylon`: states that the host runs a Cylon kernel with the dual-slot fixes (see `cxlssd.md`, "Host kernel"). Not verified by the device. |
 | `concurrent-misses` | on/off/auto | auto | Let misses to different pages wait for the media together. `auto` does so while a direct mode is active; with `der=off` it would make guest atomics lose updates (see `cxlssd.md`, "Thread ownership"). |
 | `der-replace-rate` | uint32 | 64 | With `der=memslot` and the shared 1024-alias budget full, the most cache aliases per second that a hot page may displace; zero disables replacement. |
@@ -310,6 +310,10 @@ marked "event" are cleared by `stats-reset`; the rest keep counting.
 | `der-remaps` | read uint64 | Successfully installed direct page mappings. |
 | `der-revocations` | read uint64 | Direct page mappings removed. |
 | `der-quiet-revocations` | read uint64 | Cylon revocations of entries whose accessed bit was still clear, done without a TLB flush. |
+| `uffd-faults`, `uffd-wp-faults` | read uint64 | With `der=uffd`: missing-page and first-write faults the handler took. |
+| `uffd-pending-victims` | read uint64 | With `der=uffd`: evictions refused because the victim was still being filled or was pinned for the thread that faulted on it. |
+| `uffd-stop-faults` | read uint64 | With `der=uffd`: faults the handler took after being asked to stop. |
+| `uffd-ns-ftl`, `uffd-ns-zap`, `uffd-ns-continue`, `uffd-ns-busy` | read uint64 | With `der=uffd`: handler time in FTL calls, victim zaps, `UFFDIO_CONTINUE` and all work, in ns. |
 | `der-replacements` | read uint64 | Memslot cache aliases displaced by a hotter page; each is also one remap and one revocation. |
 | `der-fallbacks` | read uint64 | Refused mapping attempts and device disablements: a full alias budget, a page whose HPA does not decode to that DPA, no eligible window, and a direct ratio that does not fit the budget, including each retry of one waiting to be mapped again. |
 | `cca-commands` | read uint64 | Event. Caching API commands completed, whatever their status. |
