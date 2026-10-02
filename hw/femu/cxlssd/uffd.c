@@ -146,11 +146,12 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
     return u;
 }
 
-static void uffd_continue(FemuUffd *u, uint64_t lpn)
+/* Map @lpn; write-protected unless @wp is false, when writes go uncaught. */
+static void uffd_continue_mode(FemuUffd *u, uint64_t lpn, bool wp)
 {
     struct uffdio_continue c = {
         .range = { (uintptr_t)u->host + lpn * 4096, 4096 },
-        .mode = UFFDIO_CONTINUE_MODE_WP,
+        .mode = wp ? UFFDIO_CONTINUE_MODE_WP : 0,
     };
 
     int64_t t = now_ns();
@@ -173,6 +174,11 @@ static void uffd_continue(FemuUffd *u, uint64_t lpn)
     qatomic_inc(&u->der->remaps);
 }
 
+static void uffd_continue(FemuUffd *u, uint64_t lpn)
+{
+    uffd_continue_mode(u, lpn, true);
+}
+
 static bool uffd_evict(void *opaque, FemuCxlEntry *e)
 {
     FemuUffd *u = opaque;
@@ -183,10 +189,15 @@ static bool uffd_evict(void *opaque, FemuCxlEntry *e)
     }
     int64_t t = now_ns();
 
-    /* Zap the guest's view; the data stays in the memfd's page cache. */
-    madvise(u->host + e->lpn * 4096, 4096, MADV_DONTNEED);
-    u->der->uffd_ns_zap += now_ns() - t;
-    qatomic_inc(&u->der->revocations);
+    /*
+     * Zap the guest's view; the data stays in the memfd's page cache. A
+     * direct ratio keeps its pages mapped, as the other modes do.
+     */
+    if (!femu_cxl_ratio_selected(u->der->ratio, e->lpn)) {
+        madvise(u->host + e->lpn * 4096, 4096, MADV_DONTNEED);
+        u->der->uffd_ns_zap += now_ns() - t;
+        qatomic_inc(&u->der->revocations);
+    }
     if (e->dirty && !uffd_media(u)->free_writeback) {
         t = now_ns();
         u->evict_ns += femu_cxl_media_direct(uffd_media(u), e->lpn, true,
@@ -245,6 +256,7 @@ static void uffd_prefetch(FemuUffd *u, uint64_t lpn)
     for (next = lpn + stride; next < end; next++) {
         if (g_hash_table_contains(cache->entries, &next) ||
             g_hash_table_contains(u->pending, &next) ||
+            femu_cxl_ratio_selected(u->der->ratio, next) ||
             femu_cxl_cache_all_pinned(cache, next)) {
             continue;
         }
@@ -302,6 +314,15 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid)
     }
     if (g_hash_table_lookup(cache->entries, &lpn)) {
         uffd_continue(u, lpn);  /* resident: a fault that raced its fill */
+        return;
+    }
+    /*
+     * A direct ratio page is mapped outside the cache at no media cost, and
+     * without write protection: as with memslot, writes through it are not
+     * seen. A ratio change uninstalls the handler, so the ratio is fixed here.
+     */
+    if (femu_cxl_ratio_selected(u->der->ratio, lpn)) {
+        uffd_continue_mode(u, lpn, false);
         return;
     }
     cache->misses++;

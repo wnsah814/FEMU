@@ -210,7 +210,9 @@ guest should pass HLT through (`-overcommit cpu-pm=on`) and turn off PV async
 page faults, or KVM's async-PF worker faults every page in for write. It refuses,
 and stays on MMIO, with no cache, `cache-policy=lifo`, fewer than 4 ways (one
 instruction may need several pages mapped at once), and `cca=on`; a direct
-ratio and a linked NVMe controller are refused outright. Prefetch works as on
+ratio maps its pages as they are first touched, outside the cache, with no
+media cost and without write protection, so writes to them are not charged; a
+linked NVMe controller is refused outright. Prefetch works as on
 the MMIO path: the pages after a miss are inserted and mapped with no media
 read.
 
