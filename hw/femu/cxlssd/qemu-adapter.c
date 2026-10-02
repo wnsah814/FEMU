@@ -1720,11 +1720,6 @@ static bool cxl_nvme_prepare(FemuCtrl *n, Error **errp)
         error_setg(errp, "cxl_ssd requires the femu-cxl-ssd to have ftl=on");
         return false;
     }
-    /* Its writes drop cache pages that the uffd handler owns. */
-    if (s->direct.uffd) {
-        error_setg(errp, "cxl_ssd cannot share a femu-cxl-ssd with der=uffd");
-        return false;
-    }
     if (s->nvme) {
         error_setg(errp, "the femu-cxl-ssd already serves an NVMe controller");
         return false;
@@ -1843,12 +1838,8 @@ void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
     der->uffd = mode && !strcmp(mode, "uffd");
     if (der->uffd) {
         der->probes++;
-        /* CCA commands change the cache from another thread. */
-        reason = "uffd cannot follow CCA commands";
-        if (!dev->media.cca_enabled) {
-            der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
-                                                &reason);
-        }
+        der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
+                                            &reason);
         if (!der->uffd_state) {
             femu_cxl_der_fallback(der, reason);
         }

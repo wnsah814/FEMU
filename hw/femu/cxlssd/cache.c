@@ -228,6 +228,19 @@ bool femu_cxl_cache_all_pinned(FemuCxlCache *c, uint64_t lpn)
     return set && set->pinned.length == c->ways;
 }
 
+/* Whether some set has every way pinned. */
+bool femu_cxl_cache_any_set_pinned(FemuCxlCache *c)
+{
+    uint32_t i;
+
+    for (i = 0; c->pinned >= c->ways && i < c->nsets; i++) {
+        if (c->sets[i].pinned.length == c->ways) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t femu_cxl_cache_pin_room(FemuCxlCache *c, uint64_t lpn)
 {
     FemuCxlSet *set = femu_cxl_cache_set(c, lpn);

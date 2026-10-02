@@ -322,6 +322,8 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid)
      * seen. A ratio change uninstalls the handler, so the ratio is fixed here.
      */
     if (femu_cxl_ratio_selected(u->der->ratio, lpn)) {
+        /* Writable and unwatched: count it as written, as memslot does. */
+        femu_cxl_nvme_mark(uffd_media(u), lpn * 4096, 4096);
         uffd_continue_mode(u, lpn, false);
         return;
     }
@@ -348,6 +350,8 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
     if (e) {
         e->dirty = true;
     }
+    /* A linked NVMe namespace counts the page written (DULBE, LBA status). */
+    femu_cxl_nvme_mark(uffd_media(u), lpn * 4096, 4096);
     ioctl(u->fd, UFFDIO_WRITEPROTECT, &w);
 }
 
@@ -497,6 +501,15 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
 
     if (u->installed) {
         return true;
+    }
+    /*
+     * A page the handler could not cache would wait for a slot forever: one
+     * in an uncached CCA range, or in a set whose every way is pinned. Stay
+     * on MMIO while any exists; the access after they go maps the window.
+     */
+    if (uffd_media(u)->cca.uncached ||
+        femu_cxl_cache_any_set_pinned(der->cache)) {
+        return false;
     }
     /*
      * The handler takes the cache over, so the access that maps the window

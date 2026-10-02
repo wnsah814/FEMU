@@ -14,6 +14,7 @@
 #include "qapi/error.h"
 #include "hw/pci/pci.h"
 #include "qemu-adapter.h"
+#include "uffd.h"
 
 /* Pages acted on, and pages looked up, per hold of the gate and the BQL. */
 #define CCA_CHUNK       256
@@ -105,6 +106,13 @@ static bool cca_enter(CcaOp *op)
         s->cca.epoch != op->epoch) {
         femu_cxl_leave(s);
         return false;
+    }
+    /*
+     * A der=uffd handler owns the cache while it is mapped: stop it and take
+     * the cache back, as invalidation does. The next access maps it again.
+     */
+    if (femu_uffd_installed(&s->direct)) {
+        femu_cxl_der_clear(&s->direct);
     }
     op->media = (FemuCxlOp) { .s = s };
     return true;

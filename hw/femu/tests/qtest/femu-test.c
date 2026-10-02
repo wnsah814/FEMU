@@ -14584,10 +14584,9 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
 
 /*
  * der=uffd refuses what it cannot model: a cache of no pages, whose faulted
- * pages would stay mapped and never be charged again; a cache that would
+ * pages would stay mapped and never be charged again, and a cache that would
  * evict a page an instruction still needs while it fills the next (LIFO, or
- * under 4 ways); and CCA commands, which change the cache from another
- * thread. The device then stays on MMIO.
+ * under 4 ways). The device then stays on MMIO.
  */
 static void femu_test_cxl_uffd_refuse(void *obj, void *data,
                                       QGuestAllocator *alloc)
@@ -14600,7 +14599,6 @@ static void femu_test_cxl_uffd_refuse(void *obj, void *data,
         "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on ";
     const char *refused[] = {
         "cache-pages=0", "cache-policy=lifo", "cache-pages=16,cache-ways=2",
-        "cca=on",
     };
     QTestState *qts;
     size_t i;
@@ -16633,6 +16631,50 @@ static void femu_test_cca_der(void *obj, void *data, QGuestAllocator *alloc)
     femu_cca_quit(&c);
 }
 
+#define FEMU_UFFD_MEMFD \
+    "-object memory-backend-memfd,id=umem,size=256M,share=on,prealloc=on "
+
+/*
+ * CCA commands under der=uffd: each takes the cache back from the handler,
+ * and the next access maps the window again. A pinned page is then reached
+ * through the mapping with no media read, its first write is caught, and an
+ * uncached range keeps the device on MMIO until it is enabled again.
+ */
+static void femu_test_cca_uffd(void *obj, void *data, QGuestAllocator *alloc)
+{
+    FemuCca c;
+    uint64_t reads;
+    uint64_t writebacks;
+
+    femu_cca_start(&c, FEMU_UFFD_MEMFD, "volatile-memdev=umem,der=uffd,"
+                   "cache-pages=4,cache-ways=4");
+    qtest_writeq(c.qts, femu_cca_page(0), 0x18);
+    if (!femu_cxl_active(c.qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        femu_cca_quit(&c);
+        return;
+    }
+    femu_cca_expect(&c, CCA_CTRL_PIN, 0, 1, 1, 0, 1);
+    g_assert_false(femu_cxl_active(c.qts));
+    g_assert_cmphex(qtest_readq(c.qts, femu_cca_page(0)), ==, 0x18);
+    g_assert_true(femu_cxl_active(c.qts));
+    reads = femu_cxl_stat(c.qts, "media-reads");
+    qtest_writeq(c.qts, femu_cca_page(1), 0x19);
+    g_assert_cmpuint(femu_cxl_stat(c.qts, "media-reads"), ==, reads);
+    writebacks = femu_cxl_stat(c.qts, "cca-writebacks");
+    femu_cca_expect(&c, CCA_CTRL_INVALIDATE, CCA_F_FORCE, 1, 1, 0, 1);
+    g_assert_cmpuint(femu_cxl_stat(c.qts, "cca-writebacks"), ==,
+                     writebacks + 1);
+    g_assert_cmphex(qtest_readq(c.qts, femu_cca_page(1)), ==, 0x19);
+    femu_cca_expect(&c, CCA_CTRL_CACHE_DISABLE, 0, 2, 1, 0, 1);
+    qtest_readq(c.qts, femu_cca_page(3));
+    g_assert_false(femu_cxl_active(c.qts));
+    femu_cca_expect(&c, CCA_CTRL_CACHE_ENABLE, 0, 2, 1, 0, 1);
+    qtest_readq(c.qts, femu_cca_page(3));
+    g_assert_true(femu_cxl_active(c.qts));
+    femu_cca_quit(&c);
+}
+
 /* Count this QEMU's threads named @name; needs -name debug-threads=on. */
 static unsigned femu_cca_threads(QTestState *qts, const char *name)
 {
@@ -17403,6 +17445,50 @@ static void femu_test_cxl_nvme_dulbe(void *obj, void *data,
 }
 
 /*
+ * A linked NVMe controller under der=uffd: its write takes the cache back from
+ * the handler and drops the cached page, so CXL then reads what NVMe wrote;
+ * a CXL write through the mapping marks its blocks written for DULBE, and an
+ * untouched page stays deallocated.
+ */
+static void femu_test_cxl_nvme_uffd(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    uint8_t pattern[FEMU_DATA_SIZE];
+    uint8_t got[FEMU_DATA_SIZE];
+    FemuLink l;
+
+    /*
+     * Leave cache-ways at its default: setting it takes the gate, and the
+     * controller then marks every block written as it attaches.
+     */
+    femu_link_start(&l, FEMU_UFFD_MEMFD, ",volatile-memdev=umem,der=uffd,"
+                    "cache-pages=16", "");
+    g_assert_cmphex(qtest_readq(l.qts, FEMU_CXL_WINDOW + 30 * 4096), ==, 0);
+    if (!femu_cxl_active(l.qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        femu_link_quit(&l);
+        return;
+    }
+    g_assert_cmpuint(FEMU_SC(femu_set_feature(&l.c, NVME_ERROR_RECOVERY,
+                            false, 1, 1 << 16, NULL)), ==, NVME_SUCCESS);
+    femu_link_write(&l, 30, 7, pattern);
+    g_assert_false(femu_cxl_active(l.qts));
+    qtest_memread(l.qts, FEMU_CXL_WINDOW + 30 * 4096, got, sizeof(got));
+    g_assert_cmpmem(got, sizeof(got), pattern, sizeof(pattern));
+    g_assert_true(femu_cxl_active(l.qts));
+    memset(pattern, 0x5a, sizeof(pattern));
+    qtest_memwrite(l.qts, FEMU_CXL_WINDOW + 31 * 4096, pattern,
+                   sizeof(pattern));
+    g_assert_cmpint(femu_link_read(&l, 31, got), ==, NVME_SUCCESS);
+    g_assert_cmpmem(got, sizeof(got), pattern, sizeof(pattern));
+    /* Read through the mapping, a page is not marked; nothing wrote 33. */
+    g_assert_cmphex(qtest_readq(l.qts, FEMU_CXL_WINDOW + 32 * 4096), ==, 0);
+    g_assert_cmpint(femu_link_read(&l, 32, got), ==, NVME_DULB);
+    g_assert_cmpint(femu_link_read(&l, 33, got), ==, NVME_DULB);
+    femu_link_quit(&l);
+}
+
+/*
  * Stores through a direct ratio never trap, so a Deallocate must leave the
  * selected pages marked written or DULBE would hide data CXL wrote later.
  */
@@ -18039,6 +18125,7 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-cca-lsa-busy", "femu", femu_test_cca_lsa_busy, NULL);
     qos_add_test("cxl-cca-disable-abandon", "femu",
                  femu_test_cca_disable_abandon, NULL);
+    qos_add_test("cxl-cca-uffd", "femu", femu_test_cca_uffd, NULL);
     qos_add_test("cxl-cca-interleave", "femu", femu_test_cca_interleave,
                  NULL);
     qos_add_test("cxl-nvme-link", "femu", femu_test_cxl_nvme_link, NULL);
@@ -18063,6 +18150,7 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-nvme-deallocate", "femu",
                  femu_test_cxl_nvme_deallocate, NULL);
     qos_add_test("cxl-nvme-dulbe", "femu", femu_test_cxl_nvme_dulbe, NULL);
+    qos_add_test("cxl-nvme-uffd", "femu", femu_test_cxl_nvme_uffd, NULL);
     qos_add_test("cxl-nvme-ratio-dulbe", "femu",
                  femu_test_cxl_nvme_ratio_dulbe, NULL);
     qos_add_test("cxl-nvme-flip", "femu", femu_test_cxl_nvme_flip, NULL);

@@ -69,6 +69,7 @@ void femu_cxl_cache_destroy(FemuCxlCache *c);
 
 FemuCxlSet *femu_cxl_cache_set(FemuCxlCache *c, uint64_t lpn);
 bool femu_cxl_cache_all_pinned(FemuCxlCache *c, uint64_t lpn);
+bool femu_cxl_cache_any_set_pinned(FemuCxlCache *c);
 uint32_t femu_cxl_cache_pin_room(FemuCxlCache *c, uint64_t lpn);
 void femu_cxl_cache_pin(FemuCxlCache *c, FemuCxlEntry *e);
 void femu_cxl_cache_unpin(FemuCxlCache *c, FemuCxlEntry *e);

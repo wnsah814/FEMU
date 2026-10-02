@@ -604,6 +604,10 @@ static void cxl_nvme_drop(FemuCxlMedia *s, uint64_t first, uint64_t last)
         return;
     }
     last = MIN(last, pages - 1);
+    /* A der=uffd handler owns the cache while it is mapped; take it back. */
+    if (femu_uffd_installed(&s->direct)) {
+        femu_cxl_der_clear(&s->direct);
+    }
     /* A clear would also revoke ratio mappings, which rule 1 keeps. */
     clear = last - first + 1 > FEMU_CXL_NVME_CLEAR && s->direct.mapped &&
             !s->direct.ratio;

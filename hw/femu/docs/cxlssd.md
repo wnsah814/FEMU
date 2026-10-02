@@ -208,13 +208,16 @@ path; the next access maps the window again. The mode needs Linux 6.4
 under KVM, and a window that decodes linearly onto the device from DPA zero. The
 guest should pass HLT through (`-overcommit cpu-pm=on`) and turn off PV async
 page faults, or KVM's async-PF worker faults every page in for write. It refuses,
-and stays on MMIO, with no cache, `cache-policy=lifo`, fewer than 4 ways (one
-instruction may need several pages mapped at once), and `cca=on`; a direct
-ratio maps its pages as they are first touched, outside the cache, with no
-media cost and without write protection, so writes to them are not charged; a
-linked NVMe controller is refused outright. Prefetch works as on
-the MMIO path: the pages after a miss are inserted and mapped with no media
-read.
+and stays on MMIO, with no cache, `cache-policy=lifo` and fewer than 4 ways (one
+instruction may need several pages mapped at once). Caching API commands and
+the drops a linked NVMe controller's writes cause clear direct mappings first,
+like invalidation, so they work on the MMIO path's cache. While an uncached
+range or a set with every way pinned exists, the window stays unmapped, since
+the handler could not cache a page there. A first write marks its blocks
+written for a linked NVMe namespace. A direct ratio maps its pages as they are
+first touched, outside the cache, with no media cost and without write
+protection, so writes to them are not charged. Prefetch works as on the MMIO
+path: the pages after a miss are inserted and mapped with no media read.
 
 ### Memslot mapping limit
 
