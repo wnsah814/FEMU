@@ -218,6 +218,10 @@ static const FemuPropDesc cxl_runtime_descs[] = {
     { "uffd-pending-victims",
       "Read-only event counter: der=uffd evictions refused because the "
       "victim was being filled or pinned for the thread that faulted" },
+    { "uffd-dropped-fills",
+      "Read-only event counter: der=uffd fills whose page a caching API "
+      "command or a linked NVMe write dropped from the cache in flight; the "
+      "thread faults again" },
     { "uffd-stop-faults",
       "Read-only event counter: faults the der=uffd handler took after it "
       "was asked to stop" },

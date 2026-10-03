@@ -31,4 +31,5 @@ void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn);
 bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn);
 void femu_uffd_uninstall(FemuCxlDer *der);
 void femu_uffd_destroy(FemuCxlDer *der);
+void femu_uffd_finalize(FemuCxlDer *der);
 #endif

@@ -18944,6 +18944,52 @@ static void femu_test_cxl_nvme_dulbe(void *obj, void *data,
 }
 
 /*
+ * der=uffd with a linked NVMe controller: an NVMe write drops the CXL cache
+ * page while the window stays mapped, and CXL then misses on it and reads
+ * the NVMe data. A CXL write miss marks its blocks written for DULBE; a read
+ * does not.
+ */
+static void femu_test_cxl_nvme_uffd(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    uint8_t pattern[FEMU_DATA_SIZE];
+    uint8_t got[FEMU_DATA_SIZE];
+    uint64_t reads;
+    FemuLink l;
+
+    /*
+     * Leave cache-ways at its default: setting it takes the gate, and the
+     * controller then marks every block written as it attaches.
+     */
+    femu_link_start(&l, "-object memory-backend-memfd,id=umem,size=256M,"
+                    "share=on,prealloc=on ",
+                    ",volatile-memdev=umem,der=uffd,cache-pages=16", "");
+    g_assert_cmphex(qtest_readq(l.qts, FEMU_CXL_WINDOW + 30 * 4096), ==, 0);
+    if (!femu_cxl_active(l.qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        femu_link_quit(&l);
+        return;
+    }
+    g_assert_cmpuint(FEMU_SC(femu_set_feature(&l.c, NVME_ERROR_RECOVERY,
+                            false, 1, 1 << 16, NULL)), ==, NVME_SUCCESS);
+    femu_link_write(&l, 30, 7, pattern);
+    g_assert_true(femu_cxl_active(l.qts));
+    reads = femu_cxl_stat(l.qts, "media-reads");
+    qtest_memread(l.qts, FEMU_CXL_WINDOW + 30 * 4096, got, sizeof(got));
+    g_assert_cmpmem(got, sizeof(got), pattern, sizeof(pattern));
+    g_assert_cmpuint(femu_cxl_stat(l.qts, "media-reads"), ==, reads + 1);
+    memset(pattern, 0x5a, sizeof(pattern));
+    qtest_memwrite(l.qts, FEMU_CXL_WINDOW + 31 * 4096, pattern,
+                   sizeof(pattern));
+    g_assert_cmpint(femu_link_read(&l, 31, got), ==, NVME_SUCCESS);
+    g_assert_cmpmem(got, sizeof(got), pattern, sizeof(pattern));
+    g_assert_cmphex(qtest_readq(l.qts, FEMU_CXL_WINDOW + 32 * 4096), ==, 0);
+    g_assert_cmpint(femu_link_read(&l, 32, got), ==, NVME_DULB);
+    g_assert_cmpint(femu_link_read(&l, 33, got), ==, NVME_DULB);
+    femu_link_quit(&l);
+}
+
+/*
  * Stores through a direct ratio never trap, so a Deallocate must leave the
  * selected pages marked written or DULBE would hide data CXL wrote later.
  */
@@ -20789,6 +20835,7 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-nvme-deallocate", "femu",
                  femu_test_cxl_nvme_deallocate, NULL);
     qos_add_test("cxl-nvme-dulbe", "femu", femu_test_cxl_nvme_dulbe, NULL);
+    qos_add_test("cxl-nvme-uffd", "femu", femu_test_cxl_nvme_uffd, NULL);
     qos_add_test("cxl-nvme-ratio-dulbe", "femu",
                  femu_test_cxl_nvme_ratio_dulbe, NULL);
     qos_add_test("cxl-nvme-flip", "femu", femu_test_cxl_nvme_flip, NULL);

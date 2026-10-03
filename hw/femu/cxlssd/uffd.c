@@ -133,6 +133,9 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                     UFFD_FEATURE_THREAD_ID,
     };
     const uint64_t features = api.features;
+    FemuCxlMedia *s = container_of(der, FemuCxlMedia, direct);
+    uint64_t size = memory_region_size(mr);
+    void *view;
     FemuUffd *u;
 
     u = g_new0(FemuUffd, 1);
@@ -157,10 +160,28 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
         g_free(u);
         return NULL;
     }
+    /*
+     * QEMU's own accesses, MMIO to uncached pages and a linked NVMe
+     * controller's transfers, use a second mapping that is never registered,
+     * so they reach the data without faulting. It outlives the handler: a
+     * linked controller keeps the backend after this device goes away.
+     */
+    *reason = "uffd cannot map the backend a second time";
+    view = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                memory_region_get_fd(mr),
+                qemu_ram_get_fd_offset(mr->ram_block));
+    if (view == MAP_FAILED) {
+        close(u->fd);
+        g_free(u);
+        return NULL;
+    }
+    der->uffd_view = view;
+    der->uffd_view_size = size;
+    s->backend.logical_space = view;
     u->der = der;
     u->ram = mr;
     u->host = memory_region_get_ram_ptr(mr);
-    u->size = memory_region_size(mr);
+    u->size = size;
     u->stop = eventfd(0, EFD_CLOEXEC);
     u->pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL,
                                        g_free);
@@ -328,6 +349,17 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
 
     u->der->uffd_faults++;
     t = g_hash_table_lookup(u->pending, &lpn);
+    /*
+     * A CCA command or a linked NVMe write dropped the page after its fill
+     * mapped it, and it was zapped: this is a new miss.
+     */
+    if (t && t->resolved && !t->transient &&
+        !g_hash_table_contains(s->cache.entries, &lpn)) {
+        u->der->uffd_dropped_fills++;
+        uffd_unpin(u, t);
+        uffd_retry(u);
+        t = NULL;
+    }
     if (t) {
         /* The fill in flight wakes every waiter; a resolved one is mapped. */
         if (t->resolved) {
@@ -346,6 +378,10 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
     if (femu_cxl_ratio_selected(u->der->ratio, lpn)) {
         femu_uffd_map_page(u->der, lpn);
         return;
+    }
+    /* A linked NVMe namespace counts the page written (DULBE, LBA status). */
+    if (write) {
+        femu_cxl_nvme_mark(s, lpn * 4096, 4096);
     }
     /*
      * Hits are not seen: a resident page faults only when the window was
@@ -384,6 +420,7 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
     };
 
     u->der->uffd_wp_faults++;
+    femu_cxl_nvme_mark(uffd_media(u), lpn * 4096, 4096);
     if (e) {
         e->dirty = true;
     } else if (t && t->transient) {
@@ -415,6 +452,7 @@ static void uffd_fire(FemuUffd *u, bool all)
             g_queue_pop_head(&u->timers);
             if (!t->transient &&
                 !g_hash_table_contains(u->der->cache->entries, &t->lpn)) {
+                u->der->uffd_dropped_fills++;
                 uffd_wake(u, t->lpn);
                 g_hash_table_remove(u->pending, &t->lpn);
                 continue;
@@ -608,8 +646,7 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
     /*
      * The access that maps the window must be the only one in the gate: with
      * overlapping misses another may still hold pages the handler would then
-     * fault on, and an access in flight after this one only copies (see
-     * femu_cxl_access()). A later access maps it.
+     * wait on. A later access maps it.
      */
     if (uffd_media(u)->accesses > 1) {
         return false;
@@ -723,6 +760,15 @@ void femu_uffd_destroy(FemuCxlDer *der)
     g_free(u);
     der->uffd_state = NULL;
 }
+
+/* Called when the device is freed, after any linked controller let go. */
+void femu_uffd_finalize(FemuCxlDer *der)
+{
+    if (der->uffd_view) {
+        munmap(der->uffd_view, der->uffd_view_size);
+        der->uffd_view = NULL;
+    }
+}
 #else
 bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
                      uint32_t ways, FemuCxlPolicy policy, bool cca,
@@ -768,6 +814,10 @@ void femu_uffd_uninstall(FemuCxlDer *der)
 }
 
 void femu_uffd_destroy(FemuCxlDer *der)
+{
+}
+
+void femu_uffd_finalize(FemuCxlDer *der)
 {
 }
 #endif

@@ -207,10 +207,14 @@ slot: charged as one uncached access and zapped once its thread moves on (at
 most 1 ms later); unlike under `der=off`, accesses while it stays mapped are not
 charged. Only an
 access with no other in progress maps the window (with `concurrent-misses=on`,
-or under `auto` just after the window is unmapped), and an MMIO access still in
-flight after that only copies. Invalidation, flush, a way change and anything
-else that clears direct mappings stop the handler; the next access maps the
-window again.
+or under `auto` just after the window is unmapped). QEMU's own accesses to the
+data, MMIO and a linked NVMe controller's transfers, go through a second
+mapping of the memfd that is not registered, so they never fault. Invalidation,
+flush, a way change and anything else that clears direct mappings stop the
+handler; the next access maps the window again. A page that a linked NVMe write
+replaces is dropped from the cache and zapped while the window stays mapped; a
+fill in flight for it wakes its thread, which faults again
+(`uffd-dropped-fills`).
 
 What the device is configured with and `der=uffd` cannot model fails realize,
 and the error names a mode that can: a backend other than a shared,
@@ -229,8 +233,10 @@ as a write miss: the page is charged a program at eviction and the fault
 waits longer. These are the guest's settings, not the device's, so the
 device only warns once, when the window is first mapped. A direct ratio maps
 its pages as they are first touched, outside the cache, with no media cost and
-without write protection, so writes to them are not charged; a linked NVMe controller is
-refused outright. Prefetch works as on the MMIO path: the pages after a miss
+without write protection, so writes to them are not charged. A write miss or a first write
+marks the page written in a linked NVMe namespace (DULBE, LBA status); a read
+miss does not, but a prefetched page is marked when it is mapped, as in the
+other direct modes. Prefetch works as on the MMIO path: the pages after a miss
 are inserted and mapped with no media read.
 
 ### Memslot mapping limit

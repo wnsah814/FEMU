@@ -1583,6 +1583,9 @@ static void cxl_init(Object *obj)
     object_property_add_uint64_ptr(obj, "uffd-stop-faults",
                                    &s->direct.uffd_stop_faults,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-dropped-fills",
+                                   &s->direct.uffd_dropped_fills,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,
@@ -1713,6 +1716,7 @@ static void cxl_finalize(Object *obj)
     g_hash_table_destroy(FEMU_CXL_SSD(obj)->media.pages);
     qemu_cond_destroy(&FEMU_CXL_SSD(obj)->media.idle);
     qemu_mutex_destroy(&FEMU_CXL_SSD(obj)->media.cache_lock);
+    femu_uffd_finalize(&FEMU_CXL_SSD(obj)->media.direct);
     femu_cxl_cca_finalize(&FEMU_CXL_SSD(obj)->media.cca);
 }
 
@@ -1739,11 +1743,6 @@ static bool cxl_nvme_prepare(FemuCtrl *n, Error **errp)
     }
     if (!s->ftl) {
         error_setg(errp, "cxl_ssd requires the femu-cxl-ssd to have ftl=on");
-        return false;
-    }
-    /* Its writes drop cache pages that the uffd handler owns. */
-    if (s->direct.uffd) {
-        error_setg(errp, "cxl_ssd cannot share a femu-cxl-ssd with der=uffd");
         return false;
     }
     if (s->nvme) {
@@ -1773,7 +1772,10 @@ static void cxl_nvme_attach(FemuCtrl *n, NvmeNamespace *ns)
 {
     FemuCxlMedia *s = &FEMU_CXL_SSD(n->cxl_dev)->media;
 
+    /* A der=uffd handler marks the namespace under the cache lock. */
+    femu_cxl_lock(s);
     s->nvme_ns = ns;
+    femu_cxl_unlock(s);
     n->cxl_done = &s->nvme_done;
     n->cxl_media = s;
     /* The bitmap cannot tell which pages earlier CXL traffic wrote. */
@@ -1807,7 +1809,9 @@ static void cxl_nvme_detach(FemuCtrl *n)
     qdev_del_unplug_blocker(DEVICE(dev), s->nvme_blocker);
     g_clear_pointer(&s->nvme_blocker, error_free);
     s->nvme = NULL;
+    femu_cxl_lock(s);
     s->nvme_ns = NULL;
+    femu_cxl_unlock(s);
     n->cxl_media = NULL;
     n->cxl_done = NULL;
     n->cxl_ssd = NULL;

@@ -57,6 +57,10 @@ struct FemuCxlDer {
     uint64_t uffd_wp_faults;
     uint64_t uffd_pending_victims;
     uint64_t uffd_stop_faults;  /* faults taken after a stop request */
+    uint64_t uffd_dropped_fills;
+    /* QEMU's own, unregistered mapping of the uffd backend, and its size. */
+    void *uffd_view;
+    uint64_t uffd_view_size;
     /* uffd time, ns: charging misses, zaps, continues, all handler work */
     uint64_t uffd_ns_ftl;
     uint64_t uffd_ns_zap;

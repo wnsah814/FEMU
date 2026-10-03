@@ -269,8 +269,8 @@ DEVICES = [
                 "kind": "runtime",
                 "props": [
                     "uffd-faults", "uffd-wp-faults", "uffd-pending-victims",
-                    "uffd-stop-faults", "uffd-ns-ftl", "uffd-ns-zap",
-                    "uffd-ns-continue", "uffd-ns-busy",
+                    "uffd-stop-faults", "uffd-dropped-fills", "uffd-ns-ftl",
+                    "uffd-ns-zap", "uffd-ns-continue", "uffd-ns-busy",
                 ],
             },
             {

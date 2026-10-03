@@ -104,6 +104,7 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | `uffd-wp-faults` | `uint64` | Read-only event counter: first-write faults the der=uffd handler took, each marking a resident page dirty |
 | `uffd-pending-victims` | `uint64` | Read-only event counter: der=uffd evictions refused because the victim was being filled or pinned for the thread that faulted |
 | `uffd-stop-faults` | `uint64` | Read-only event counter: faults the der=uffd handler took after it was asked to stop |
+| `uffd-dropped-fills` | `uint64` | Read-only event counter: der=uffd fills whose page a caching API command or a linked NVMe write dropped from the cache in flight; the thread faults again |
 | `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent charging misses: media requests and cache fills with their evictions and prefetches |
 | `uffd-ns-zap` | `uint64` | Read-only: time in ns spent zapping evicted der=uffd pages |
 | `uffd-ns-continue` | `uint64` | Read-only: time in ns the der=uffd handler spent in UFFDIO_CONTINUE |

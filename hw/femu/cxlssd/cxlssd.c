@@ -416,15 +416,6 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
         return MEMTX_ERROR;
     }
     last = (dpa + size - 1) / 4096;
-    /* uffd owns the cache once mapped; a late MMIO access only copies. */
-    if (femu_uffd_installed(&s->direct)) {
-        if (write) {
-            memcpy((uint8_t *)s->backend.logical_space + dpa, data, size);
-        } else {
-            memcpy(data, (uint8_t *)s->backend.logical_space + dpa, size);
-        }
-        return MEMTX_OK;
-    }
     /*
      * Hold the pages, in ascending order, so accesses to a page stay ordered
      * and a second miss to it waits for the first fill instead of repeating it.
@@ -619,31 +610,39 @@ uint64_t femu_cxl_nvme_ftl(FemuCtrl *n, NvmeNamespace *ns, NvmeRequest *req)
 #define FEMU_CXL_NVME_CLEAR 64
 
 /*
+ * Whether dropping [first, last] revokes every direct mapping at once. A
+ * clear would also revoke ratio mappings, which rule 1 keeps.
+ */
+static bool cxl_nvme_clears(FemuCxlMedia *s, uint64_t first, uint64_t last)
+{
+    uint64_t pages = s->backend.size / 4096;
+
+    return first < pages &&
+           MIN(last, pages - 1) - first + 1 > FEMU_CXL_NVME_CLEAR &&
+           s->direct.mapped && !s->direct.ratio;
+}
+
+/*
  * The NVMe command already programmed or unmapped these pages, so a cached
  * copy must not be written back: that would program them twice, or map a
- * deallocated page again. Revoke direct mappings first so Cylon's dirty
- * sample is discarded with the entry. Pinned pages stay resident and pinned,
- * as the caching API promised, but clean.
+ * deallocated page again. Revoke direct mappings first, unless @cleared
+ * revoked them all, so Cylon's dirty sample is discarded with the entry.
+ * Pinned pages stay resident and pinned, as the caching API promised, but
+ * clean. Called under @cache_lock.
  */
-static void cxl_nvme_drop(FemuCxlMedia *s, uint64_t first, uint64_t last)
+static void cxl_nvme_drop(FemuCxlMedia *s, uint64_t first, uint64_t last,
+                          bool cleared)
 {
     g_autoptr(GPtrArray) victims = g_ptr_array_new();
     uint64_t pages = s->backend.size / 4096;
     FemuCxlEntry *e;
     uint64_t lpn;
-    bool clear;
     guint i;
 
     if (first >= pages) {
         return;
     }
     last = MIN(last, pages - 1);
-    /* A clear would also revoke ratio mappings, which rule 1 keeps. */
-    clear = last - first + 1 > FEMU_CXL_NVME_CLEAR && s->direct.mapped &&
-            !s->direct.ratio;
-    if (clear) {
-        femu_cxl_der_clear(&s->direct);
-    }
     if (last - first + 1 <= g_hash_table_size(s->cache.entries)) {
         for (lpn = first; lpn <= last; lpn++) {
             e = g_hash_table_lookup(s->cache.entries, &lpn);
@@ -670,7 +669,7 @@ static void cxl_nvme_drop(FemuCxlMedia *s, uint64_t first, uint64_t last)
     femu_cxl_nvme_mark_ratio(s, first, last);
     for (i = 0; i < victims->len; i++) {
         e = g_ptr_array_index(victims, i);
-        if (!clear && !femu_cxl_ratio_selected(s->direct.ratio, e->lpn)) {
+        if (!cleared && !femu_cxl_ratio_selected(s->direct.ratio, e->lpn)) {
             femu_cxl_der_remove(&s->direct, e->lpn);
         }
         s->nvme_drops++;
@@ -691,6 +690,7 @@ void femu_cxl_nvme_bh(void *opaque)
     FemuCxlMedia *s = opaque;
     GArray *ranges;
     uint64_t done;
+    bool clear = false;
     guint i;
 
     if (s->busy || s->accesses) {
@@ -703,12 +703,21 @@ void femu_cxl_nvme_bh(void *opaque)
     s->nvme_ranges = g_array_new(false, false, sizeof(FemuCxlRange));
     done = ++s->nvme_taken;
     qemu_mutex_unlock(&s->lock);
+    /* A clear stops a der=uffd handler, so it runs before the cache lock. */
+    for (i = 0; i < ranges->len && !clear; i++) {
+        FemuCxlRange *r = &g_array_index(ranges, FemuCxlRange, i);
+
+        clear = cxl_nvme_clears(s, r->first, r->last);
+    }
+    if (clear) {
+        femu_cxl_der_clear(&s->direct);
+    }
     femu_cxl_der_begin(&s->direct);
     femu_cxl_lock(s);
     for (i = 0; i < ranges->len; i++) {
         FemuCxlRange *r = &g_array_index(ranges, FemuCxlRange, i);
 
-        cxl_nvme_drop(s, r->first, r->last);
+        cxl_nvme_drop(s, r->first, r->last, clear);
     }
     s->cache_entries = g_hash_table_size(s->cache.entries);
     femu_cxl_unlock(s);
