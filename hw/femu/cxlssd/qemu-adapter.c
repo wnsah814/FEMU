@@ -496,7 +496,7 @@ static MemTxResult adapter_access(FemuCxlWindow *w, hwaddr offset,
             result = MEMTX_OK;
         } else {
             /* Invalidation revoked a memslot ratio; map it again first. */
-            if (s->direct.ratio && !s->direct.cylon && !s->direct.uffd &&
+            if (s->direct.ratio && s->direct.ops->ratio_on_access &&
                 !s->direct.ratio_end) {
                 cxl_ratio_restore(FEMU_CXL_SSD(dev), NULL);
             }
@@ -1829,40 +1829,6 @@ void femu_cxl_der_fallback(FemuCxlDer *der, const char *reason)
     }
 }
 
-void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
-                       FemuCxlCache *cache)
-{
-    const char *reason = NULL;
-
-    der->dev = dev;
-    der->cache = cache;
-    der->maps = g_hash_table_new(g_int64_hash, g_int64_equal);
-    der->windows = g_ptr_array_new();
-    g_queue_init(&der->installed);
-    der->cylon = mode && !strcmp(mode, "cylon");
-    der->uffd = mode && !strcmp(mode, "uffd");
-    if (der->uffd) {
-        der->probes++;
-        /* CCA commands change the cache from another thread. */
-        reason = "uffd cannot follow CCA commands";
-        if (!dev->media.cca_enabled) {
-            der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
-                                                &reason);
-        }
-        if (!der->uffd_state) {
-            femu_cxl_der_fallback(der, reason);
-        }
-    } else if (der->cylon) {
-        der->probes++;
-        der->fast = femu_cylon_prepare(der, &reason);
-        if (!der->fast) {
-            femu_cxl_der_fallback(der, reason);
-        }
-    } else {
-        der->available = mode && !strcmp(mode, "memslot");
-    }
-}
-
 /* Limit direct mappings to a single endpoint on a decoderless host bridge. */
 static void der_windows_scan(FemuCxlDer *der)
 {
@@ -2042,29 +2008,15 @@ static bool der_linear(FemuCxlDer *der, CXLFixedWindow *fw)
 #endif
 }
 
-bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
-                      FemuCxlEntry *e)
+/*
+ * Whether the page at @hpa, whose DPA is @dpa, can be mapped at all by a
+ * per-page backend. As in Cylon, a ratio adds to cached mappings instead of
+ * limiting them.
+ */
+static bool der_page_ok(FemuCxlDer *der, uint64_t hpa, uint64_t dpa)
 {
-    uint64_t lpn = dpa / 4096;
-    FemuCxlMap *map;
-    FemuCxlMap *victim = NULL;
-    CXLFixedWindow *fw;
     uint64_t check;
 
-    /*
-     * uffd maps the whole window at once, from a demand access (@e set): a
-     * prefetch must not start the handler while its access still inserts.
-     * The alias maps window offset X to backend offset X.
-     */
-    if (der->uffd) {
-        fw = e && der->uffd_state ? der_window(der, hpa) : NULL;
-        if (fw && !der_linear(der, fw)) {
-            der->fallbacks++;
-            return false;
-        }
-        return fw && femu_uffd_map(der, fw, OBJECT(der->dev));
-    }
-    /* As in Cylon, a ratio adds to cached mappings instead of limiting them. */
     if ((!der->available && !der->fast) || (hpa & 4095) != (dpa & 4095)) {
         return false;
     }
@@ -2077,15 +2029,29 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
         der->fallbacks++;
         return false;
     }
-    if (!der->cylon && g_hash_table_contains(der->maps, &lpn)) {
+    return true;
+}
+
+static bool memslot_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
+                        FemuCxlEntry *e)
+{
+    uint64_t lpn = dpa / 4096;
+    FemuCxlMap *map;
+    FemuCxlMap *victim = NULL;
+    CXLFixedWindow *fw;
+
+    if (!der_page_ok(der, hpa, dpa)) {
+        return false;
+    }
+    if (g_hash_table_contains(der->maps, &lpn)) {
         return true;
     }
     /* A ratio run covers selected pages; never add one-page aliases there. */
-    if (!der->cylon && femu_cxl_ratio_selected(der->ratio, lpn)) {
+    if (femu_cxl_ratio_selected(der->ratio, lpn)) {
         return lpn < der->ratio_end;
     }
     /* A full budget is the common refusal; decide it before the window. */
-    if (!der->cylon && !der_alias_budget()) {
+    if (!der_alias_budget()) {
         victim = der_replace_due(der, e) ? der_replace_victim(der) : NULL;
         if (!victim) {
             der->fallbacks++;
@@ -2096,9 +2062,6 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
     if (!fw) {
         der->fallbacks++;
         return false;
-    }
-    if (der->cylon) {
-        return femu_cylon_map(der, fw, hpa, dpa);
     }
     /* One transaction, so the swap rebuilds the flat view once. */
     memory_region_transaction_begin();
@@ -2111,6 +2074,45 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
     map->link.data = map;
     g_queue_push_tail_link(&der->installed, &map->link);
     return true;
+}
+
+static bool cylon_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
+                      FemuCxlEntry *e)
+{
+    CXLFixedWindow *fw;
+
+    if (!der_page_ok(der, hpa, dpa)) {
+        return false;
+    }
+    fw = der_window(der, hpa);
+    if (!fw) {
+        der->fallbacks++;
+        return false;
+    }
+    return femu_cylon_map(der, fw, hpa, dpa);
+}
+
+/*
+ * uffd maps the whole window at once, from a demand access (@e set): a
+ * prefetch must not start the handler while its access still inserts.
+ * The alias maps window offset X to backend offset X.
+ */
+static bool uffd_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
+                     FemuCxlEntry *e)
+{
+    CXLFixedWindow *fw = e && der->uffd_state ? der_window(der, hpa) : NULL;
+
+    if (fw && !der_linear(der, fw)) {
+        der->fallbacks++;
+        return false;
+    }
+    return fw && femu_uffd_map(der, fw, OBJECT(der->dev));
+}
+
+bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
+                      FemuCxlEntry *e)
+{
+    return der->ops->map(der, hpa, dpa, e);
 }
 
 /* Runs are the gaps between multiples of the period, or one whole run. */
@@ -2161,43 +2163,20 @@ static bool der_ratio_apply(FemuCxlSsd *dev, CXLFixedWindow *fw, Error **errp)
     return true;
 }
 
-/* Map the current ratio; the caller holds the gate and revoked everything. */
-static bool cxl_ratio_map(FemuCxlSsd *dev, Error **errp)
+/* The window a ratio maps through: decoded here, linearly, from DPA zero. */
+static CXLFixedWindow *der_ratio_window(FemuCxlSsd *dev, Error **errp)
 {
-    FemuCxlMedia *s = &dev->media;
-    FemuCxlDer *der = &s->direct;
-    GSList *windows;
+    FemuCxlDer *der = &dev->media.direct;
+    GSList *windows = cxl_fmws_get_all_sorted();
     GSList *it;
     CXLFixedWindow *fw = NULL;
 
-    /* After unplug the device has no bus to route a window through. */
-    if (!der->ratio || s->closing || (!der->available && !der->fast)) {
-        return true;
-    }
-    /* der=uffd maps ratio pages as they are touched (see uffd_miss()). */
-    if (der->uffd) {
-        return true;
-    }
-    /* Refuse on the count first: a retry on every access must stay cheap. */
-    if (!der->cylon) {
-        uint64_t runs = der_ratio_runs(femu_cxl_ratio_period(der->ratio),
-                                       s->backend.size / 4096);
-        uint64_t budget = der_alias_budget();
-
-        if (runs > budget) {
-            der->fallbacks++;
-            error_setg(errp, "DER ratio needs %" PRIu64 " mappings, at most %"
-                       PRIu64 " are available", runs, budget);
-            return false;
-        }
-    }
-    windows = cxl_fmws_get_all_sorted();
     for (it = windows; it; it = it->next) {
         CXLFixedWindow *candidate = CXL_FMW(it->data);
 
         if (der_window(der, candidate->base) == candidate &&
             adapter_linear(&dev->parent_obj, candidate->base,
-                           s->backend.size)) {
+                           dev->media.backend.size)) {
             fw = candidate;
             break;
         }
@@ -2205,13 +2184,51 @@ static bool cxl_ratio_map(FemuCxlSsd *dev, Error **errp)
     g_slist_free(windows);
     if (!fw) {
         error_setg(errp, "DER ratio requires a decoded linear window");
+    }
+    return fw;
+}
+
+static bool memslot_ratio_map(FemuCxlSsd *dev, Error **errp)
+{
+    FemuCxlDer *der = &dev->media.direct;
+    uint64_t runs = der_ratio_runs(femu_cxl_ratio_period(der->ratio),
+                                   dev->media.backend.size / 4096);
+    uint64_t budget = der_alias_budget();
+    CXLFixedWindow *fw;
+
+    /* Refuse on the count first: a retry on every access must stay cheap. */
+    if (runs > budget) {
+        der->fallbacks++;
+        error_setg(errp, "DER ratio needs %" PRIu64 " mappings, at most %"
+                   PRIu64 " are available", runs, budget);
         return false;
     }
-    if (der->cylon) {
-        cylon_ratio_apply(der, fw);
+    fw = der_ratio_window(dev, errp);
+    return fw && der_ratio_apply(dev, fw, errp);
+}
+
+static bool cylon_ratio_map(FemuCxlSsd *dev, Error **errp)
+{
+    CXLFixedWindow *fw = der_ratio_window(dev, errp);
+
+    if (fw) {
+        cylon_ratio_apply(&dev->media.direct, fw);
+    }
+    return fw;
+}
+
+/* Map the current ratio; the caller holds the gate and revoked everything. */
+static bool cxl_ratio_map(FemuCxlSsd *dev, Error **errp)
+{
+    FemuCxlMedia *s = &dev->media;
+    FemuCxlDer *der = &s->direct;
+
+    /* After unplug the device has no bus to route a window through. */
+    if (!der->ratio || s->closing || (!der->available && !der->fast)) {
         return true;
     }
-    return der_ratio_apply(dev, fw, errp);
+    /* A backend without ratio_map maps selected pages as they are touched. */
+    return !der->ops->ratio_map || der->ops->ratio_map(dev, errp);
 }
 
 /*
@@ -2260,8 +2277,8 @@ static void cxl_ratio(FemuCxlSsd *dev, uint64_t ratio, Error **errp)
                    "ranges exist");
         goto out;
     }
-    if (der->cylon) {
-        cylon_ratio_revoke(der);
+    if (der->ops->ratio_revoke) {
+        der->ops->ratio_revoke(der);
     } else {
         femu_cxl_der_clear(der);
     }
@@ -2277,23 +2294,10 @@ out:
     object_unref(OBJECT(dev));
 }
 
-void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn)
+static void memslot_unmap(FemuCxlDer *der, uint64_t lpn)
 {
     FemuCxlMap *map = g_hash_table_lookup(der->maps, &lpn);
 
-    /*
-     * Only the MMIO path evicts pages here, and it owns the cache only while
-     * uffd is not mapped, when uffd maps nothing. The callers that drop single
-     * pages from elsewhere (CCA, a linked NVMe controller) are refused.
-     */
-    if (der->uffd) {
-        return;
-    }
-
-    if (der->cylon) {
-        femu_cylon_remove(der, lpn);
-        return;
-    }
     if (!map) {
         return;
     }
@@ -2311,38 +2315,161 @@ void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn)
 }
 
 /*
+ * Only the MMIO path evicts pages here, and it owns the cache only while
+ * uffd is not mapped, when uffd maps nothing. The callers that drop single
+ * pages from elsewhere (CCA, a linked NVMe controller) are refused.
+ */
+static void uffd_unmap(FemuCxlDer *der, uint64_t lpn)
+{
+}
+
+void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn)
+{
+    der->ops->unmap(der, lpn);
+}
+
+/* Memslot cannot see writes through an alias; its entries are kept dirty. */
+static bool memslot_sample(FemuCxlDer *der, uint64_t lpn)
+{
+    return false;
+}
+
+static bool uffd_sample(FemuCxlDer *der, uint64_t lpn)
+{
+    return false;
+}
+
+/*
  * Whether a direct ratio page was written since the last sample. Memslot
  * cannot tell and keeps such entries dirty; Cylon reads the EPT dirty bit
  * and keeps the page mapped.
  */
 bool femu_cxl_der_sample(FemuCxlDer *der, uint64_t lpn)
 {
-    return der->cylon && femu_cylon_sample(der, lpn);
+    return der->ops->sample(der, lpn);
 }
 
-void femu_cxl_der_clear(FemuCxlDer *der)
+static void memslot_flush(FemuCxlDer *der)
 {
     GHashTableIter it;
     gpointer key;
 
-    /* Stop the handler and hand the cache back to the MMIO path. */
-    if (der->uffd) {
-        femu_uffd_uninstall(der);
-        return;
-    }
-
-    if (der->cylon) {
-        femu_cylon_clear(der);
-        return;
-    }
     der->ratio_end = 0;
     memory_region_transaction_begin();
     while (g_hash_table_size(der->maps)) {
         g_hash_table_iter_init(&it, der->maps);
         g_hash_table_iter_next(&it, &key, NULL);
-        femu_cxl_der_remove(der, *(uint64_t *)key);
+        memslot_unmap(der, *(uint64_t *)key);
     }
     memory_region_transaction_commit();
+}
+
+/* Stop the handler and hand the cache back to the MMIO path. */
+static void uffd_flush(FemuCxlDer *der)
+{
+    femu_uffd_uninstall(der);
+}
+
+void femu_cxl_der_clear(FemuCxlDer *der)
+{
+    der->ops->flush(der);
+}
+
+/*
+ * The DER backends. der=off uses the memslot operations with mapping
+ * unavailable, which map nothing.
+ */
+/* One transaction, so a batch rebuilds the flat view once. */
+static void memslot_begin(FemuCxlDer *der)
+{
+    memory_region_transaction_begin();
+}
+
+static void memslot_commit(FemuCxlDer *der)
+{
+    memory_region_transaction_commit();
+}
+
+void femu_cxl_der_begin(FemuCxlDer *der)
+{
+    if (der->ops->begin) {
+        der->ops->begin(der);
+    }
+}
+
+void femu_cxl_der_commit(FemuCxlDer *der)
+{
+    if (der->ops->commit) {
+        der->ops->commit(der);
+    }
+}
+
+static const FemuCxlDerOps der_memslot_ops = {
+    .name = "memslot",
+    .map = memslot_map,
+    .unmap = memslot_unmap,
+    .sample = memslot_sample,
+    .flush = memslot_flush,
+    .begin = memslot_begin,
+    .commit = memslot_commit,
+    .ratio_map = memslot_ratio_map,
+    .ratio_on_access = true,
+};
+
+static const FemuCxlDerOps der_cylon_ops = {
+    .name = "cylon",
+    .sees_writes = true,
+    .map = cylon_map,
+    .unmap = femu_cylon_remove,
+    .sample = femu_cylon_sample,
+    .flush = femu_cylon_clear,
+    .ratio_map = cylon_ratio_map,
+    .ratio_revoke = cylon_ratio_revoke,
+};
+
+static const FemuCxlDerOps der_uffd_ops = {
+    .name = "uffd",
+    .sees_writes = true,
+    .map = uffd_map,
+    .unmap = uffd_unmap,
+    .sample = uffd_sample,
+    .flush = uffd_flush,
+};
+
+void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
+                       FemuCxlCache *cache)
+{
+    const char *reason = NULL;
+
+    der->dev = dev;
+    der->cache = cache;
+    der->maps = g_hash_table_new(g_int64_hash, g_int64_equal);
+    der->windows = g_ptr_array_new();
+    g_queue_init(&der->installed);
+    der->cylon = mode && !strcmp(mode, "cylon");
+    der->uffd = mode && !strcmp(mode, "uffd");
+    der->ops = der->cylon ? &der_cylon_ops : der->uffd ? &der_uffd_ops :
+               &der_memslot_ops;
+    if (der->uffd) {
+        der->probes++;
+        /* CCA commands change the cache from another thread. */
+        reason = "uffd cannot follow CCA commands";
+        if (!dev->media.cca_enabled) {
+            der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
+                                                &reason);
+        }
+        if (!der->uffd_state) {
+            femu_cxl_der_fallback(der, reason);
+        }
+    } else if (der->cylon) {
+        der->probes++;
+        der->fast = femu_cylon_prepare(der, &reason);
+        if (!der->fast) {
+            femu_cxl_der_fallback(der, reason);
+        }
+    } else {
+        der->available = mode && !strcmp(mode, "memslot");
+    }
 }
 
 /* Revoke everything and refuse new mappings, keeping state for teardown. */
@@ -3184,7 +3311,7 @@ static void cxl_dump_spt(FemuCxlDer *der, FILE *file, uint64_t limit)
     int n;
 
     n = fprintf(file, "mode=%s ratio=%" PRIu64 " mapped=%" PRIu64 "\n",
-                der->cylon ? "cylon" : "memslot", der->ratio, der->mapped);
+                der->ops->name, der->ratio, der->mapped);
     bytes = MAX(n, 0);
     g_hash_table_iter_init(&it, der->maps);
     while (g_hash_table_iter_next(&it, NULL, &value)) {

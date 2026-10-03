@@ -431,7 +431,7 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                 }
                 s->prefetch_inserts++;
                 if (cxl_map(s, generation, next_hpa, next * 4096, NULL) &&
-                    !s->direct.cylon && !s->direct.uffd) {
+                    !s->direct.ops->sees_writes) {
                     prefetched->dirty = true;
                 }
             }
@@ -458,7 +458,7 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
         if ((e || femu_cxl_ratio_selected(s->direct.ratio, first)) &&
             !femu_cxl_cca_uncached(&s->cca, first) &&
             cxl_map(s, generation, hpa, dpa, e) &&
-            !s->direct.cylon && !s->direct.uffd && e) {
+            !s->direct.ops->sees_writes && e) {
             /* Direct writes cannot update metadata, so charge on eviction. */
             e->dirty = true;
         }
@@ -669,17 +669,13 @@ void femu_cxl_nvme_bh(void *opaque)
     s->nvme_ranges = g_array_new(false, false, sizeof(FemuCxlRange));
     done = ++s->nvme_taken;
     qemu_mutex_unlock(&s->lock);
-    if (!s->direct.cylon) {
-        memory_region_transaction_begin();
-    }
+    femu_cxl_der_begin(&s->direct);
     for (i = 0; i < ranges->len; i++) {
         FemuCxlRange *r = &g_array_index(ranges, FemuCxlRange, i);
 
         cxl_nvme_drop(s, r->first, r->last);
     }
-    if (!s->direct.cylon) {
-        memory_region_transaction_commit();
-    }
+    femu_cxl_der_commit(&s->direct);
     g_array_free(ranges, true);
     s->cache_entries = g_hash_table_size(s->cache.entries);
     qemu_mutex_lock(&s->lock);

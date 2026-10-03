@@ -7,8 +7,39 @@ typedef struct FemuCylon FemuCylon;
 typedef struct FemuUffd FemuUffd;
 typedef struct FemuCxlSsd FemuCxlSsd;
 
-typedef struct FemuCxlDer {
+typedef struct FemuCxlDer FemuCxlDer;
+
+/*
+ * How a DER mode maps cached pages for direct access. The cache, its policy
+ * and the counters are shared; a backend only maps and unmaps pages, and
+ * reports writes it saw.
+ */
+typedef struct FemuCxlDerOps {
+    const char *name;
+    /* Writes through a mapping are reported by sample() or at unmap. */
+    bool sees_writes;
+    /* Restore a revoked ratio on the next MMIO access. */
+    bool ratio_on_access;
+    /* Map the page at @hpa for @dpa; @e is NULL for a prefetch. */
+    bool (*map)(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
+                FemuCxlEntry *e);
+    /* Revoke the page's mapping; a write seen through it marks it dirty. */
+    void (*unmap)(FemuCxlDer *der, uint64_t lpn);
+    /* Whether a mapped page was written since the last sample. */
+    bool (*sample)(FemuCxlDer *der, uint64_t lpn);
+    /* Revoke every mapping. */
+    void (*flush)(FemuCxlDer *der);
+    /* Bracket a batch of unmaps; optional. */
+    void (*begin)(FemuCxlDer *der);
+    void (*commit)(FemuCxlDer *der);
+    /* Map or revoke a direct ratio as a whole; optional. */
+    bool (*ratio_map)(FemuCxlSsd *dev, Error **errp);
+    void (*ratio_revoke)(FemuCxlDer *der);
+} FemuCxlDerOps;
+
+struct FemuCxlDer {
     FemuCxlSsd *dev;
+    const FemuCxlDerOps *ops;
     GHashTable *maps;
     uint64_t ratio;
     uint64_t ratio_end;
@@ -47,7 +78,7 @@ typedef struct FemuCxlDer {
     uint64_t fallbacks;
     uint64_t probes;
     uint64_t mapped;
-} FemuCxlDer;
+};
 
 /*
  * Cylon's direct ratios leave every period-th page on MMIO; zero means no
@@ -95,6 +126,8 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
 void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn);
 bool femu_cxl_der_sample(FemuCxlDer *der, uint64_t lpn);
 void femu_cxl_der_clear(FemuCxlDer *der);
+void femu_cxl_der_begin(FemuCxlDer *der);
+void femu_cxl_der_commit(FemuCxlDer *der);
 void femu_cxl_der_disable(FemuCxlDer *der);
 void femu_cxl_der_fallback(FemuCxlDer *der, const char *reason);
 void femu_cxl_der_destroy(FemuCxlDer *der);

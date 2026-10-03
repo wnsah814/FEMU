@@ -371,9 +371,7 @@ static int cca_drop_batch(CcaOp *op)
     int status = 0;
     guint i;
 
-    if (!s->direct.cylon) {
-        memory_region_transaction_begin();
-    }
+    femu_cxl_der_begin(&s->direct);
     for (i = 0; i < op->batch->len; i++) {
         uint64_t lpn = g_array_index(op->batch, uint64_t, i);
 
@@ -381,9 +379,7 @@ static int cca_drop_batch(CcaOp *op)
             femu_cxl_der_remove(&s->direct, lpn);
         }
     }
-    if (!s->direct.cylon) {
-        memory_region_transaction_commit();
-    }
+    femu_cxl_der_commit(&s->direct);
     for (i = 0; i < op->batch->len && !cca_abandoned(s, op->epoch); i++) {
         uint64_t lpn = g_array_index(op->batch, uint64_t, i);
         FemuCxlEntry *e = g_hash_table_lookup(c->entries, &lpn);
