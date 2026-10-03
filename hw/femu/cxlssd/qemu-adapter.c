@@ -496,7 +496,8 @@ static MemTxResult adapter_access(FemuCxlWindow *w, hwaddr offset,
             result = MEMTX_OK;
         } else {
             /* Invalidation revoked a memslot ratio; map it again first. */
-            if (s->direct.ratio && !s->direct.cylon && !s->direct.ratio_end) {
+            if (s->direct.ratio && !s->direct.cylon && !s->direct.uffd &&
+                !s->direct.ratio_end) {
                 cxl_ratio_restore(FEMU_CXL_SSD(dev), NULL);
             }
             result = femu_cxl_access(s, hpa, dpa, data, size, write);
@@ -2173,6 +2174,10 @@ static bool cxl_ratio_map(FemuCxlSsd *dev, Error **errp)
     if (!der->ratio || s->closing || (!der->available && !der->fast)) {
         return true;
     }
+    /* der=uffd maps ratio pages as they are touched (see uffd_miss()). */
+    if (der->uffd) {
+        return true;
+    }
     /* Refuse on the count first: a retry on every access must stay cheap. */
     if (!der->cylon) {
         uint64_t runs = der_ratio_runs(femu_cxl_ratio_period(der->ratio),
@@ -2239,9 +2244,8 @@ static void cxl_ratio(FemuCxlSsd *dev, uint64_t ratio, Error **errp)
         error_setg(errp, "unsupported Cylon direct ratio");
         return;
     }
-    if (ratio && (!s->der || !strcmp(s->der, "off") ||
-                  !strcmp(s->der, "uffd"))) {
-        error_setg(errp, "a direct ratio requires der=memslot or der=cylon");
+    if (ratio && (!s->der || !strcmp(s->der, "off"))) {
+        error_setg(errp, "a direct ratio requires der=memslot, cylon or uffd");
         return;
     }
     object_ref(OBJECT(dev));
