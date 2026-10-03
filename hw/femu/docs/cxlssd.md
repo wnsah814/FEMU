@@ -222,10 +222,14 @@ only falls back to MMIO with a warning, as `der=cylon` does on an unpatched
 kernel: the mode needs Linux 6.4 (`UFFDIO_CONTINUE_MODE_WP`), access to
 `/dev/userfaultfd` or `CAP_SYS_PTRACE` under KVM, and a window that decodes
 linearly onto the device from DPA zero. The guest should pass HLT through
-(`-overcommit cpu-pm=on`) and turn off PV async page faults, or KVM's async-PF
-worker faults every page in for write. A direct ratio maps its pages as they
-are first touched, outside the cache, with no media cost and without write
-protection, so writes to them are not charged; a linked NVMe controller is
+(`-overcommit cpu-pm=on`) and turn off PV async page faults
+(`kvm-asyncpf=off`). Otherwise KVM may fault a page in from its async-PF
+worker, for write (Linux's `kvm_can_do_async_pf()`), so a read miss arrives
+as a write miss: the page is charged a program at eviction and the fault
+waits longer. These are the guest's settings, not the device's, so the
+device only warns once, when the window is first mapped. A direct ratio maps
+its pages as they are first touched, outside the cache, with no media cost and
+without write protection, so writes to them are not charged; a linked NVMe controller is
 refused outright. Prefetch works as on the MMIO path: the pages after a miss
 are inserted and mapped with no media read.
 

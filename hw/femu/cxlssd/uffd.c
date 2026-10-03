@@ -18,8 +18,10 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qemu/userfaultfd.h"
+#include "hw/core/cpu.h"
 #include "system/hostmem.h"
 #include "system/kvm.h"
+#include "system/system.h"
 #include "qemu-adapter.h"
 #include "uffd.h"
 
@@ -554,6 +556,38 @@ static bool uffd_cache_fits(FemuCxlCache *c)
 }
 
 /*
+ * KVM faults a page in from a worker thread, for write, unless the guest
+ * passes HLT through and has PV async page faults off (Linux's
+ * kvm_can_do_async_pf()). A read miss then arrives as a write miss: the page
+ * is charged a program at eviction, and the fault waits longer. The guest's
+ * configuration is not the device's, so only warn.
+ */
+static void uffd_check_guest(void)
+{
+    static bool warned;
+    bool asyncpf = false;
+    CPUState *cs;
+
+    if (!kvm_enabled() || warned) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        Error *err = NULL;
+
+        asyncpf |= object_property_get_bool(OBJECT(cs), "kvm-asyncpf", &err);
+        error_free(err);
+    }
+    if (!enable_cpu_pm || asyncpf) {
+        warned = true;
+        warn_report("der=uffd: the guest %s, so KVM faults pages in for "
+                    "write and reads are charged as writes; use "
+                    "-overcommit cpu-pm=on and -cpu ...,kvm-asyncpf=off",
+                    !enable_cpu_pm ? "does not pass HLT through" :
+                    "has PV async page faults on");
+    }
+}
+
+/*
  * The first decoded access maps the whole window. Entries already resident
  * stay resident: their pages fault once and are continued at no media cost.
  * The caller checked that the window decodes linearly onto the backend.
@@ -603,6 +637,7 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
         femu_uffd_destroy(der);
         return false;
     }
+    uffd_check_guest();
     qemu_thread_create(&u->thread, "femu-cxl-uffd", uffd_thread, u,
                        QEMU_THREAD_JOINABLE);
     if (!u->container) {

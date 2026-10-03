@@ -321,7 +321,7 @@ CXL_SIZE=1G CHANNELS=8 LUNS_PER_CHANNEL=4 READ_NS=50000 PROGRAM_NS=500000 \
 
 With `der=off` every load and store traps to QEMU, even a cache hit. That
 gives exact counts and exact timing, but a hit costs microseconds. The other
-two modes map cached pages straight into the guest, so hits run at DRAM speed
+modes map cached pages straight into the guest, so hits run at DRAM speed
 without an exit.
 
 | Mode | How hits are served | Needs | Limits |
@@ -329,6 +329,7 @@ without an exit.
 | `off` (default) | Every access traps to QEMU | Nothing | Slow hits; every hit is counted and timed |
 | `memslot` | Cached pages become KVM memory slot aliases | KVM. Refused under TCG | At most 1024 mapped pages (4 MiB) across all devices |
 | `cylon` | Cached pages are written into KVM's page tables by a Cylon host kernel | The fixed Cylon host kernel, a hugetlb backend, `cylon-kernel-ack=on` | Only on that kernel; falls back to MMIO elsewhere |
+| `uffd` | The window is one alias of the backend; pages outside the cache are zapped and a userfaultfd handler fills them | Linux 6.4, a shared preallocated memfd backend, 4 or more ways and not `lifo`, `/dev/userfaultfd` under KVM | One handler thread; every eviction flushes the VM's TLBs |
 
 As a reference point, one host (Xeon Gold 6548Y+, 256 MiB device, 1024-page
 cache) measured a median cached load of about 3.0 us with `off` and 105 ns
@@ -370,6 +371,40 @@ invisible to QEMU, so its eviction costs a program.
 Realize refuses `der=memslot` under TCG ("der=memslot is not supported with
 TCG; use KVM, or der=off"): the alias changes would race with other vCPUs'
 TLBs. Use `memslot` for hot sets of up to 4 MiB on a stock kernel.
+
+### `der=uffd`
+
+`uffd` needs no host kernel change. The whole window is one alias of the
+backend, and a page outside the cache is zapped from the backend's page
+tables, so touching it raises a userfaultfd minor fault. A handler thread
+charges the miss through the same cache code as the MMIO path, waits out the
+media time and maps the page. A page that was read first is mapped
+write-protected, so its first write is caught and only written pages are
+programmed. Hits, guest atomics and page tables on CXL memory run on the
+hardware.
+
+It needs:
+
+- Linux 6.4 or later (`UFFDIO_CONTINUE_MODE_WP`) and, under KVM, access to
+  `/dev/userfaultfd` or `CAP_SYS_PTRACE`. Without them the device warns and
+  stays on MMIO.
+- A shared, preallocated `memory-backend-memfd`, a cache, and 4 or more ways
+  with a policy other than `lifo`. Realize fails otherwise, naming a mode
+  that takes the configuration.
+- A guest that passes HLT through and has PV async page faults off:
+  `-overcommit cpu-pm=on` and `kvm-asyncpf=off` on `-cpu`. Otherwise KVM
+  faults pages in for write from a worker thread, so reads are charged as
+  writes and take longer. The device warns once when either is missing.
+
+<!-- femu-untested: needs KVM and root for /dev/userfaultfd -->
+```bash
+sudo DER=uffd CACHE_WAYS=full \
+    CXL_BACKEND=memory-backend-memfd,share=on,prealloc=on \
+    CPU=host,kvm-asyncpf=off ../femu-scripts/run-cxlssd.sh -overcommit cpu-pm=on
+```
+
+The design note's [userfaultfd mapping](../cxlssd.md#userfaultfd-mapping)
+section has the details.
 
 ### `der=cylon`
 
