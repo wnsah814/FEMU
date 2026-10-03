@@ -29,6 +29,7 @@ bool femu_uffd_installed(FemuCxlDer *der);
 bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn);
 void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn);
 bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn);
+bool femu_uffd_accessed(FemuCxlDer *der, uint64_t lpn);
 bool femu_uffd_holes_fit(FemuCxlDer *der, const unsigned long *map,
                          uint64_t start, uint64_t end, bool set);
 MemoryRegion *femu_cxl_window_io(CXLFixedWindow *fw);

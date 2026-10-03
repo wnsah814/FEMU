@@ -97,6 +97,9 @@ struct FemuUffd {
     MemoryRegion *container;    /* where the alias was added, once */
     uint64_t base;              /* the window's HPA */
     MemoryRegion *io;           /* the device's MMIO region in the window */
+    /* /proc/self/pagemap and the idle page bitmap, or -1 */
+    int pagemap_fd;
+    int idle_fd;
     GPtrArray *holes;           /* UffdHole, one per run of uncached pages */
     bool holes_over;            /* too many runs: the window stays unmapped */
     bool installed;
@@ -224,6 +227,9 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
     u->ram = mr;
     u->host = memory_region_get_ram_ptr(mr);
     u->size = size;
+    /* Both need root: PFNs in pagemap, and the bitmap itself. */
+    u->pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    u->idle_fd = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
     u->stop = eventfd(0, EFD_CLOEXEC);
     u->pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL,
                                        g_free);
@@ -565,6 +571,48 @@ static bool uffd_held(FemuUffd *u, uint64_t lpn)
         }
     }
     return false;
+}
+
+/*
+ * Whether the guest touched a mapped page since the last call: a hit that
+ * never reaches the device, seen through idle page tracking, whose walk of
+ * the page's mappings clears KVM's EPT accessed bit too, with no TLB flush.
+ * The first call after a fill sees the faulting access. False when the page
+ * is not mapped, or without root (PFNs in pagemap, the idle bitmap) or the
+ * kernel's CONFIG_IDLE_PAGE_TRACKING, as for direct hits in the other modes.
+ */
+bool femu_uffd_accessed(FemuCxlDer *der, uint64_t lpn)
+{
+    FemuUffd *u = der->uffd_state;
+    uint64_t entry, word, bit, pfn;
+    off_t off;
+    bool accessed;
+
+    if (!u || !u->installed || u->pagemap_fd < 0 || u->idle_fd < 0 ||
+        pread(u->pagemap_fd, &entry, 8,
+              ((uintptr_t)u->host / 4096 + lpn) * 8) != 8 ||
+        !(entry >> 63)) {
+        return false;
+    }
+    pfn = entry & ((1ULL << 55) - 1);
+    off = pfn / 64 * 8;
+    bit = 1ULL << (pfn % 64);
+    /* Without CAP_SYS_ADMIN pagemap shows no PFNs: stop asking. */
+    if (!pfn || pread(u->idle_fd, &word, 8, off) != 8) {
+        if (!pfn) {
+            close(u->idle_fd);
+            u->idle_fd = -1;
+        }
+        return false;
+    }
+    accessed = !(word & bit);
+    /* Idle again from here; writing a bit marks only that page. */
+    if (pwrite(u->idle_fd, &bit, 8, off) != 8) {
+        return false;
+    }
+    der->uffd_idle_checks++;
+    der->uffd_idle_accessed += accessed;
+    return accessed;
 }
 
 /*
@@ -1134,6 +1182,12 @@ void femu_uffd_destroy(FemuCxlDer *der)
         object_unparent(OBJECT(&u->alias));
     }
     g_ptr_array_free(u->holes, true);
+    if (u->pagemap_fd >= 0) {
+        close(u->pagemap_fd);
+    }
+    if (u->idle_fd >= 0) {
+        close(u->idle_fd);
+    }
     g_hash_table_destroy(u->threads);
     g_array_free(u->zaps, true);
     close(u->fd);
@@ -1190,6 +1244,11 @@ void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
 }
 
 bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn)
+{
+    return false;
+}
+
+bool femu_uffd_accessed(FemuCxlDer *der, uint64_t lpn)
 {
     return false;
 }

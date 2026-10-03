@@ -233,6 +233,13 @@ static const FemuPropDesc cxl_runtime_descs[] = {
       "Read-only event counter: MADV_DONTNEED calls that zapped evicted "
       "der=uffd pages, each a TLB flush; contiguous victims of one handler "
       "batch share one" },
+    { "uffd-idle-checks",
+      "Read-only event counter: der=uffd pages whose accessed state CLOCK or "
+      "S3-FIFO read through idle page tracking (root and "
+      "CONFIG_IDLE_PAGE_TRACKING); stays 0 without them" },
+    { "uffd-idle-accessed",
+      "Read-only event counter: of uffd-idle-checks, the pages the guest "
+      "had touched since the last check, each counted as a hit" },
     { "uffd-stop-faults",
       "Read-only event counter: faults the der=uffd handler took after it "
       "was asked to stop" },

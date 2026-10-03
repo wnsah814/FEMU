@@ -182,7 +182,9 @@ when several decoders or a DPA skip put that HPA at another DPA or at none.
 Uncached pages of the caching API are never mapped. Every memslot-mapped
 entry is conservatively dirty because alias writes cannot notify cache
 metadata; Cylon samples EPT dirty bits instead. Direct hits in either mode do
-not update CLOCK/S3-FIFO reference metadata or MMIO hit counters.
+not update CLOCK/S3-FIFO reference metadata or MMIO hit counters; under
+`der=uffd` they reach the reference metadata through idle page tracking (see
+"userfaultfd mapping").
 
 ### userfaultfd mapping
 
@@ -223,10 +225,26 @@ completes in about 0.6 ms with the hold (`hw/femu/tools/uffd`). LIFO
 and sets under 4 ways would put most multi-page instructions into a hold, with
 misses `der=off` would not charge, so they are still refused.
 
+Hits never reach the handler, but CLOCK and S3-FIFO can still see them: when
+the policy considers a resident page, the handler reads whether the guest
+touched it since the last look through idle page tracking
+(`/sys/kernel/mm/page_idle/bitmap`, for the page's PFN from
+`/proc/self/pagemap`), whose walk of the page's mappings clears KVM's EPT
+accessed bit without a TLB flush, and counts a touch as a hit
+(`uffd-idle-checks`, `uffd-idle-accessed`). Each resident page is asked about
+at most once per eviction, so the hand stops even while the guest keeps
+touching pages; QEMU's own accesses to a page (MMIO, a linked NVMe
+controller) count as touches too. It needs root and
+`CONFIG_IDLE_PAGE_TRACKING`; without them the policies see no hits, as under
+`memslot` and `cylon`. On a skewed read load (80% of reads to 192 hot pages,
+256-page cache) the miss ratio was 0.426 with FIFO in both modes, 0.354 with
+CLOCK under `der=off`, and 0.354 with CLOCK under `der=uffd`, against 0.426
+without idle page tracking.
+
 The cache, its policy, prefetch and the counters are the MMIO path's: the
 handler and MMIO accesses share them under one lock, so the same accesses give
 the same misses, fills, evictions and media work as under `der=off` (qtest
-`cxl-uffd-same`). Hits are not seen, as in the other direct modes; a page cached
+`cxl-uffd-same`). Hits are not counted, as in the other direct modes; a page cached
 before the window was mapped faults once and counts as a hit. A page whose set
 has every way pinned, or that NAND has no room to fill, is served without a
 slot: charged as one uncached access and zapped once its thread moves on (at

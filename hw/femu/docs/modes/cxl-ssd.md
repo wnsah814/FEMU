@@ -338,8 +338,8 @@ with `memslot` and with `cylon`.
 What changes in the direct modes:
 
 - A direct hit never reaches QEMU, so it is not counted in `cache-hits`,
-  does not update the `clock` or `s3-fifo` reference state, and has no media
-  time.
+  does not update the `clock` or `s3-fifo` reference state (except under
+  `der=uffd` with idle page tracking, below), and has no media time.
 - Direct mapping works only in the topology `run-cxlssd.sh` builds: one
   endpoint directly below the only root port of a host bridge, in a window
   with one target, not interleaved. Elsewhere the device still works, all
@@ -391,6 +391,10 @@ It needs:
 - A shared, preallocated `memory-backend-memfd`, a cache, and 4 or more ways
   with a policy other than `lifo`. Realize fails otherwise, naming a mode
   that takes the configuration.
+- For `clock` and `s3-fifo` to see hits, root and a host kernel with
+  `CONFIG_IDLE_PAGE_TRACKING`: the policy then reads the guest's accesses
+  back from EPT accessed bits. Without them the policies see no hits, as
+  under the other direct modes.
 - A guest that passes HLT through and has PV async page faults off:
   `-overcommit cpu-pm=on` and `kvm-asyncpf=off` on `-cpu`. Otherwise KVM
   faults pages in for write from a worker thread, so reads are charged as

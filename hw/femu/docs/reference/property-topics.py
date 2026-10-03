@@ -270,7 +270,8 @@ DEVICES = [
                 "props": [
                     "uffd-faults", "uffd-wp-faults", "uffd-pending-victims",
                     "uffd-stop-faults", "uffd-dropped-fills", "uffd-holds",
-                    "uffd-transient-fills", "uffd-zap-calls", "uffd-ns-ftl",
+                    "uffd-transient-fills", "uffd-zap-calls",
+                    "uffd-idle-checks", "uffd-idle-accessed", "uffd-ns-ftl",
                     "uffd-ns-zap", "uffd-ns-continue", "uffd-ns-busy",
                 ],
             },

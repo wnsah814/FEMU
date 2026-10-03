@@ -54,6 +54,13 @@ typedef struct FemuCxlCache {
     uint64_t pinned;
     /* Bumped by every rebuild, so a long operation can notice one. */
     uint64_t generation;
+    /*
+     * Whether a resident page was accessed since the last call: hits that
+     * never reach the cache under a direct mode, if the backend can see them.
+     * CLOCK and S3-FIFO count them as hits when they consider the page.
+     */
+    bool (*accessed)(void *opaque, uint64_t lpn);
+    void *accessed_opaque;
 } FemuCxlCache;
 
 typedef bool (*FemuCxlEvict)(void *opaque, FemuCxlEntry *entry);

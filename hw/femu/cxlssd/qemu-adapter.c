@@ -1607,6 +1607,12 @@ static void cxl_init(Object *obj)
     object_property_add_uint64_ptr(obj, "uffd-zap-calls",
                                    &s->direct.uffd_zap_calls,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-idle-checks",
+                                   &s->direct.uffd_idle_checks,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-idle-accessed",
+                                   &s->direct.uffd_idle_accessed,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,
@@ -2503,10 +2509,18 @@ static const FemuCxlDerOps der_uffd_ops = {
     .unmap = uffd_unmap,
     .sample = uffd_sample,
     .busy = femu_uffd_busy,
+    .accessed = femu_uffd_accessed,
     .flush = uffd_flush,
     .holes_fit = femu_uffd_holes_fit,
     .holes = femu_uffd_holes,
 };
+
+static bool der_cache_accessed(void *opaque, uint64_t lpn)
+{
+    FemuCxlDer *der = opaque;
+
+    return der->ops->accessed(der, lpn);
+}
 
 void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
                        FemuCxlCache *cache)
@@ -2522,6 +2536,10 @@ void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
     der->uffd = mode && !strcmp(mode, "uffd");
     der->ops = der->cylon ? &der_cylon_ops : der->uffd ? &der_uffd_ops :
                &der_memslot_ops;
+    if (der->ops->accessed) {
+        cache->accessed = der_cache_accessed;
+        cache->accessed_opaque = der;
+    }
     if (der->uffd) {
         der->probes++;
         der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,

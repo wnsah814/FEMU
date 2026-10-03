@@ -94,6 +94,14 @@ static bool cache_evict(FemuCxlCache *c, FemuCxlSet *set,
     GQueue *queue = &set->small;
     /* Pins take ways away; size the small queue from what is left. */
     uint32_t ways = c->ways - set->pinned.length;
+    /*
+     * Ask about each entry once: the guest keeps touching pages while the
+     * hand turns, and answers that keep coming back yes would never end it.
+     */
+    uint32_t asks = c->accessed &&
+                    (c->policy == FEMU_CXL_CLOCK ||
+                     c->policy == FEMU_CXL_S3FIFO) ?
+                    set->small.length + set->main.length : 0;
     FemuCxlEntry *e;
     bool ghost = false;
 
@@ -105,6 +113,9 @@ static bool cache_evict(FemuCxlCache *c, FemuCxlSet *set,
         e = c->policy == FEMU_CXL_LIFO ? g_queue_peek_tail(queue) :
                                        g_queue_peek_head(queue);
         g_assert(e);
+        if (asks && asks-- && c->accessed(c->accessed_opaque, e->lpn)) {
+            e->freq = MIN(e->freq + 1, 3);
+        }
         if (c->policy == FEMU_CXL_CLOCK && e->freq) {
             e->freq = 0;
             g_queue_push_tail_link(queue, g_queue_pop_head_link(queue));
@@ -375,4 +386,6 @@ void femu_cxl_cache_rebuild(FemuCxlCache *c, uint32_t pages, uint32_t ways)
     c->inserts = previous.inserts;
     c->evictions = previous.evictions;
     c->generation = previous.generation + 1;
+    c->accessed = previous.accessed;
+    c->accessed_opaque = previous.accessed_opaque;
 }

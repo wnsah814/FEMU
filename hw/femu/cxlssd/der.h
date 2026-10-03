@@ -29,6 +29,8 @@ typedef struct FemuCxlDerOps {
     bool (*sample)(FemuCxlDer *der, uint64_t lpn);
     /* Whether the page is still being mapped, so cannot be evicted. */
     bool (*busy)(FemuCxlDer *der, uint64_t lpn);
+    /* Whether a mapped page was accessed since the last call; optional. */
+    bool (*accessed)(FemuCxlDer *der, uint64_t lpn);
     /* Revoke every mapping. */
     void (*flush)(FemuCxlDer *der);
     /* Bracket a batch of unmaps; optional. */
@@ -69,6 +71,8 @@ struct FemuCxlDer {
     uint64_t uffd_holds;
     uint64_t uffd_transient_fills;
     uint64_t uffd_zap_calls;
+    uint64_t uffd_idle_checks;
+    uint64_t uffd_idle_accessed;
     /* QEMU's own, unregistered mapping of the uffd backend, and its size. */
     void *uffd_view;
     uint64_t uffd_view_size;

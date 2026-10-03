@@ -108,6 +108,8 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | `uffd-holds` | `uint64` | Read-only event counter: der=uffd holds entered, each when a thread lost a recent page twice while faulting on no new page; its recent pages then stay cached until it goes quiet |
 | `uffd-transient-fills` | `uint64` | Read-only event counter: der=uffd fills a hold left no victim for, mapped without a cache slot and charged as uncached accesses |
 | `uffd-zap-calls` | `uint64` | Read-only event counter: MADV_DONTNEED calls that zapped evicted der=uffd pages, each a TLB flush; contiguous victims of one handler batch share one |
+| `uffd-idle-checks` | `uint64` | Read-only event counter: der=uffd pages whose accessed state CLOCK or S3-FIFO read through idle page tracking (root and CONFIG_IDLE_PAGE_TRACKING); stays 0 without them |
+| `uffd-idle-accessed` | `uint64` | Read-only event counter: of uffd-idle-checks, the pages the guest had touched since the last check, each counted as a hit |
 | `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent charging misses: media requests and cache fills with their evictions and prefetches |
 | `uffd-ns-zap` | `uint64` | Read-only: time in ns spent zapping evicted der=uffd pages |
 | `uffd-ns-continue` | `uint64` | Read-only: time in ns the der=uffd handler spent in UFFDIO_CONTINUE |
