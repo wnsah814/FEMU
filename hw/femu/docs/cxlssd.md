@@ -214,13 +214,17 @@ flush, a way change and anything else that clears direct mappings stop the
 handler; the next access maps the window again. A page that a linked NVMe write
 replaces is dropped from the cache and zapped while the window stays mapped; a
 fill in flight for it wakes its thread, which faults again
-(`uffd-dropped-fills`).
+(`uffd-dropped-fills`). Caching API commands work the same way: they change the
+cache under the lock and zap the pages they drop, so they give the same
+counters and QUERY answers as under `der=off` (qtest `cxl-cca-uffd-same`). An
+uncached range's pages are zapped too; an access to one faults and is charged
+as an uncached access, but only once until its thread moves on.
 
 What the device is configured with and `der=uffd` cannot model fails realize,
 and the error names a mode that can: a backend other than a shared,
 preallocated `memory-backend-memfd` (`der=memslot`), no cache (`der=off`),
 `cache-policy=lifo` or fewer than 4 ways (`der=cylon`, `der=memslot`; one
-instruction may need several pages mapped at once), and `cca=on`. Setting
+instruction may need several pages mapped at once). Setting
 `cache-ways` below 4 at run time is refused the same way. What the host lacks
 only falls back to MMIO with a warning, as `der=cylon` does on an unpatched
 kernel: the mode needs Linux 6.4 (`UFFDIO_CONTINUE_MODE_WP`), access to
@@ -548,7 +552,7 @@ needs a range to stay non-resident must stop accessing it.
 | Command | Semantics |
 | --- | --- |
 | NOP | Status 0 |
-| PIN | All or nothing. Resident pages are pinned; others are filled as a miss would be (a media read, counted in `media-reads` and `cca-pin-fills` but not as a guest miss), possibly evicting an unpinned page, then pinned. `-ENOSPC` if a set lacks room, `-EBUSY` on an uncached page, `-EOPNOTSUPP` without a cache. A way change between chunks rechecks the rest (`-EAGAIN`) |
+| PIN | All or nothing. Resident pages are pinned; others are filled as a miss would be (a media read, counted in `media-reads` and `cca-pin-fills` but not as a guest miss), possibly evicting an unpinned page, then pinned. `-ENOSPC` if a set lacks room, `-EBUSY` on an uncached page, `-EOPNOTSUPP` without a cache. A way change between chunks rechecks the rest (`-EAGAIN`); under `der=uffd`, `-EAGAIN` also when the page to evict is one a fill is still mapping. After `-EAGAIN` the pages pinned before it stay pinned and the failed page's read is charged |
 | UNPIN | Returns pinned pages to the queue a fresh insert would use: main for S3-FIFO with more than one way, else small, so under LIFO the page is the next victim. Dirty state is kept |
 | INVALIDATE | Revokes the direct mappings of the chunk's resident pages (ratio-selected pages keep their ratio mapping), then writes dirty pages back through the eviction path and drops them without ghost history; pinned pages need `CCA_F_FORCE`, else `-EBUSY` with nothing changed. `-EIO` if NAND refuses the write, leaving that page and the rest of the range resident |
 | CACHE_DISABLE | Marks pages uncached, then drops resident ones as INVALIDATE does. Accesses to uncached pages go to the media every time (a read, or a program per write), with no insert, prefetch or direct mapping. `-EBUSY` while a direct ratio is set, or for pinned pages without `CCA_F_FORCE`. On `-EIO`, or when a reset abandons the command, the pages it could not drop lose their uncached mark, so an uncached page is never resident |

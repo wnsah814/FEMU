@@ -52,6 +52,8 @@ struct CcaOp {
     uint64_t dirty;
     uint64_t pinned;
     uint64_t uncached;
+    /* Revoke every direct mapping before the walk (see cca_prepare()). */
+    bool clear;
 };
 
 static bool cca_abandoned(FemuCxlMedia *s, uint32_t epoch)
@@ -327,9 +329,11 @@ static int cca_pin_page(CcaOp *op, uint64_t lpn)
         if (!femu_cxl_media(&op->media, lpn, false)) {
             return -EIO;
         }
+        op->media.held = false;
         e = femu_cxl_cache_insert(c, lpn, cca_evict, &op->media);
         if (!e) {
-            return -EIO;
+            /* Under der=uffd the victim may be a page a fill still maps. */
+            return op->media.held ? -EAGAIN : -EIO;
         }
         s->cca.pin_fills++;
         op->work++;
@@ -372,6 +376,13 @@ static int cca_drop_batch(CcaOp *op)
     int status = 0;
     guint i;
 
+    /*
+     * Under the cache lock, so a der=uffd fill cannot map a page between its
+     * revocation and its removal; one that is in flight finds it gone. Only
+     * memslot brackets the batch in a memory transaction, and it has no
+     * handler to wait for this lock while the transaction waits for vCPUs.
+     */
+    femu_cxl_lock(s);
     femu_cxl_der_begin(&s->direct);
     for (i = 0; i < op->batch->len; i++) {
         uint64_t lpn = g_array_index(op->batch, uint64_t, i);
@@ -381,7 +392,7 @@ static int cca_drop_batch(CcaOp *op)
         }
     }
     femu_cxl_der_commit(&s->direct);
-    femu_cxl_lock(s);
+    op->media.drop = true;
     for (i = 0; i < op->batch->len && !cca_abandoned(s, op->epoch); i++) {
         uint64_t lpn = g_array_index(op->batch, uint64_t, i);
         FemuCxlEntry *e = g_hash_table_lookup(c->entries, &lpn);
@@ -399,6 +410,7 @@ static int cca_drop_batch(CcaOp *op)
             op->acted++;
         }
     }
+    op->media.drop = false;
     femu_cxl_unlock(s);
     g_array_set_size(op->batch, 0);
     return status;
@@ -530,10 +542,8 @@ static int cca_prepare(CcaOp *op)
          * Page by page, Cylon flushes the whole VM twice per page. Many
          * pages revoke everything at once; later accesses map again.
          */
-        if ((op->list ? op->list->len : op->end - op->start) > CCA_CLEAR &&
-            s->direct.mapped) {
-            femu_cxl_der_clear(&s->direct);
-        }
+        op->clear = (op->list ? op->list->len : op->end - op->start) >
+                    CCA_CLEAR && s->direct.mapped;
         return 0;
     case CCA_CTRL_CACHE_ENABLE:
         before = cca_uncached_count(cca, op->start, op->end);
@@ -577,6 +587,7 @@ static void cca_disable_undo(CcaOp *op)
         femu_cxl_leave(s);
         return;
     }
+    femu_cxl_lock(s);
     if (op->end - op->start <= g_hash_table_size(c->entries)) {
         for (lpn = op->start; lpn < op->end; lpn++) {
             if (g_hash_table_contains(c->entries, &lpn) &&
@@ -600,6 +611,7 @@ static void cca_disable_undo(CcaOp *op)
     if (!cca->uncached) {
         g_clear_pointer(&cca->uncached_map, g_free);
     }
+    femu_cxl_unlock(s);
     femu_cxl_leave(s);
 }
 
@@ -619,7 +631,16 @@ static bool cca_exec(FemuCxlMedia *s, CcaOp *op, struct cca_ctrl_resp_s *resp)
         if (!cca_enter(op)) {
             return false;
         }
+        /*
+         * A der=uffd handler reads the cache and the uncached map under the
+         * cache lock; a clear stops it, so it runs after.
+         */
+        femu_cxl_lock(s);
         status = cca_prepare(op);
+        femu_cxl_unlock(s);
+        if (op->clear) {
+            femu_cxl_der_clear(&s->direct);
+        }
         cca_leave(op);
         if (status == 1) {
             status = 0;
@@ -664,9 +685,9 @@ static void cca_apply_reset(FemuCxlMedia *s)
         if (s->started && !s->closing) {
             femu_cxl_lock(s);
             femu_cxl_cache_unpin_all(&s->cache);
-            femu_cxl_unlock(s);
             g_clear_pointer(&cca->uncached_map, g_free);
             cca->uncached = 0;
+            femu_cxl_unlock(s);
         }
         femu_cxl_leave(s);
     }

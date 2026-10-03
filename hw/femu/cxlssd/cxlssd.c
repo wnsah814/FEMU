@@ -226,7 +226,7 @@ bool femu_cxl_evict(void *opaque, FemuCxlEntry *e)
      */
     if ((!cxl_op_holds(op, e->lpn) &&
          g_hash_table_contains(s->pages, &e->lpn)) ||
-        femu_cxl_der_busy(&s->direct, e->lpn)) {
+        (!op->drop && femu_cxl_der_busy(&s->direct, e->lpn))) {
         op->held = true;
         return false;
     }

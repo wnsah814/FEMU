@@ -90,8 +90,7 @@ static FemuCxlMedia *uffd_media(FemuUffd *u)
  * femu_uffd_prepare()), as der=cylon does on an unpatched kernel.
  */
 bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
-                     uint32_t ways, FemuCxlPolicy policy, bool cca,
-                     Error **errp)
+                     uint32_t ways, FemuCxlPolicy policy, Error **errp)
 {
     int fd = memory_region_get_fd(host_memory_backend_get_memory(backend));
     struct statfs fs;
@@ -112,11 +111,6 @@ bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
         error_setg(errp, "der=uffd needs cache-policy other than lifo and "
                    "cache-ways >= %d; der=cylon and der=memslot take any",
                    FEMU_UFFD_MIN_WAYS);
-        return false;
-    }
-    if (cca) {
-        error_setg(errp, "der=uffd does not take cca=on; der=cylon and "
-                   "der=memslot do");
         return false;
     }
     return true;
@@ -771,8 +765,7 @@ void femu_uffd_finalize(FemuCxlDer *der)
 }
 #else
 bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
-                     uint32_t ways, FemuCxlPolicy policy, bool cca,
-                     Error **errp)
+                     uint32_t ways, FemuCxlPolicy policy, Error **errp)
 {
     error_setg(errp, "der=uffd needs Linux");
     return false;

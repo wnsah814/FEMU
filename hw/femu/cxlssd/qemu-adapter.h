@@ -28,6 +28,11 @@ typedef struct FemuCxlOp {
      * is stopped before invalidation and teardown.
      */
     bool handler;
+    /*
+     * Drops pages on request rather than to make room: a page a der=uffd
+     * fill still maps goes too, and the fill finds it gone.
+     */
+    bool drop;
     bool held;
     /* Pages this operation holds itself; its prefetch may evict them. */
     const uint64_t *own;

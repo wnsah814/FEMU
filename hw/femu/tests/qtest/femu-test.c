@@ -16031,8 +16031,8 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
  * der=uffd refuses at realize what it cannot model, naming a mode that can: a
  * backend it cannot fault on, a cache of no pages, whose faulted pages would
  * stay mapped and never be charged again, a cache that would evict a page an
- * instruction still needs while it fills the next (LIFO, or under 4 ways),
- * and cca=on. A way change below 4 is refused at run time too.
+ * instruction still needs while it fills the next (LIFO, or under 4 ways).
+ * A way change below 4 is refused at run time too.
  */
 static void femu_test_cxl_uffd_refuse(void *obj, void *data,
                                       QGuestAllocator *alloc)
@@ -16047,8 +16047,6 @@ static void femu_test_cxl_uffd_refuse(void *obj, void *data,
           "der=cylon and der=memslot take any" },
         { "'volatile-memdev':'mem','cache-pages':16,'cache-ways':2",
           "der=cylon and der=memslot take any" },
-        { "'volatile-memdev':'mem','cca':true",
-          "der=cylon and der=memslot do" },
     };
     QTestState *qts = qtest_init(
         "-machine q35,cxl=on -m 128M "
@@ -18028,6 +18026,126 @@ static void femu_test_cca_query(void *obj, void *data,
         g_assert_cmpuint(r.uncached, ==, 1);
     }
     femu_cca_quit(&c);
+}
+
+#define FEMU_UFFD_MEMFD \
+    "-object memory-backend-memfd,id=umem,size=256M,share=on,prealloc=on "
+
+/*
+ * CCA commands under der=uffd go through the same cache code and leave the
+ * window mapped: a pinned page is then reached with no media read and its
+ * first write is caught, and a forced invalidation writes it back.
+ */
+static void femu_test_cca_uffd(void *obj, void *data, QGuestAllocator *alloc)
+{
+    FemuCca c;
+    FemuCcaResp r;
+    uint64_t reads;
+    uint64_t writebacks;
+
+    femu_cca_start(&c, FEMU_UFFD_MEMFD, "volatile-memdev=umem,der=uffd,"
+                   "cache-pages=4,cache-ways=4");
+    qtest_writeq(c.qts, femu_cca_page(0), 0x18);
+    if (!femu_cxl_active(c.qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        femu_cca_quit(&c);
+        return;
+    }
+    femu_cca_expect(&c, CCA_CTRL_PIN, 0, 1, 1, 0, 1);
+    g_assert_true(femu_cxl_active(c.qts));
+    reads = femu_cxl_stat(c.qts, "media-reads");
+    qtest_writeq(c.qts, femu_cca_page(1), 0x19);
+    g_assert_cmpuint(femu_cxl_stat(c.qts, "media-reads"), ==, reads);
+    g_assert_cmpint(femu_cca_cmd(&c, CCA_CTRL_QUERY, 0, 0, 4, &r), ==, 0);
+    g_assert_cmpuint(r.resident, ==, 2);
+    g_assert_cmpuint(r.dirty, ==, 2);
+    g_assert_cmpuint(r.pinned, ==, 1);
+    writebacks = femu_cxl_stat(c.qts, "cca-writebacks");
+    femu_cca_expect(&c, CCA_CTRL_INVALIDATE, CCA_F_FORCE, 1, 1, 0, 1);
+    g_assert_cmpuint(femu_cxl_stat(c.qts, "cca-writebacks"), ==,
+                     writebacks + 1);
+    g_assert_true(femu_cxl_active(c.qts));
+    g_assert_cmphex(qtest_readq(c.qts, femu_cca_page(1)), ==, 0x19);
+    g_assert_cmpuint(femu_cxl_stat(c.qts, "media-reads"), ==, reads + 1);
+    g_assert_cmphex(qtest_readq(c.qts, femu_cca_page(0)), ==, 0x18);
+    femu_cca_quit(&c);
+}
+
+static const char *const femu_cca_same_stats[] = {
+    "read-misses", "write-misses", "cache-inserts", "cache-evictions",
+    "prefetch-inserts", "media-reads", "media-writes", "cca-pin-fills",
+    "cca-dropped", "cca-writebacks",
+};
+
+/*
+ * cxl-uffd-same with caching API commands among the accesses: PIN, QUERY,
+ * INVALIDATE and UNPIN. False if der=uffd could not map the window.
+ */
+static bool femu_cca_same_run(const char *der, uint64_t *stats,
+                              FemuCcaResp *query)
+{
+    g_autofree char *options = g_strdup_printf(
+        "volatile-memdev=umem,der=%s,cache-pages=64,cache-ways=4,"
+        "read-ns=1000,program-ns=1000", der);
+    bool mapped;
+    uint64_t i;
+    FemuCca c;
+
+    femu_cca_start(&c, FEMU_UFFD_MEMFD, options);
+    femu_cxl_number(c.qts, "prefetch-degree", 2, true);
+    qtest_readq(c.qts, femu_cca_page(0));
+    mapped = femu_cxl_active(c.qts);
+    for (i = 0; i < 150; i++) {
+        qtest_readq(c.qts, femu_cca_page(i * 7 % 400));
+    }
+    femu_cca_expect(&c, CCA_CTRL_PIN, 0, 300, 4, 0, 4);
+    for (i = 0; i < 100; i++) {
+        qtest_writeq(c.qts, femu_cca_page(i * 13 % 400), i);
+    }
+    g_assert_cmpint(femu_cca_cmd(&c, CCA_CTRL_QUERY, 0, 0, 400, query), ==,
+                    0);
+    g_assert_cmpint(femu_cca_cmd(&c, CCA_CTRL_INVALIDATE, 0, 0, 200, NULL),
+                    ==, 0);
+    femu_cca_expect(&c, CCA_CTRL_UNPIN, 0, 300, 4, 0, 4);
+    for (i = 0; i < 150; i++) {
+        qtest_readq(c.qts, femu_cca_page(i * 11 % 500));
+    }
+    femu_cxl_set(c.qts, "flush-cache", true);
+    for (i = 0; i < ARRAY_SIZE(femu_cca_same_stats); i++) {
+        stats[i] = femu_cxl_stat(c.qts, femu_cca_same_stats[i]);
+    }
+    femu_cca_quit(&c);
+    return mapped;
+}
+
+/*
+ * The caching API means the same in every DER mode: the same commands among
+ * the same accesses give the same misses, fills, drops and write-backs, and
+ * QUERY the same residency, under der=off and der=uffd.
+ */
+static void femu_test_cca_uffd_same(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    uint64_t off[ARRAY_SIZE(femu_cca_same_stats)];
+    uint64_t uffd[ARRAY_SIZE(femu_cca_same_stats)];
+    FemuCcaResp qoff, quffd;
+    unsigned i;
+
+    femu_cca_same_run("off", off, &qoff);
+    if (!femu_cca_same_run("uffd", uffd, &quffd)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(femu_cca_same_stats); i++) {
+        g_test_message("%s: off %" PRIu64 ", uffd %" PRIu64,
+                       femu_cca_same_stats[i], off[i], uffd[i]);
+        g_assert_cmpuint(uffd[i], ==, off[i]);
+    }
+    g_assert_cmpuint(quffd.resident, ==, qoff.resident);
+    g_assert_cmpuint(quffd.dirty, ==, qoff.dirty);
+    g_assert_cmpuint(quffd.pinned, ==, qoff.pinned);
+    g_assert_cmpuint(qoff.pinned, ==, 4);
+    g_assert_cmpuint(off[8], >, 0);
 }
 
 static void femu_cca_expect_fatal(FemuCca *c, uint32_t reason)
@@ -20850,6 +20968,8 @@ static void femu_register_nodes(void)
                  NULL);
     qos_add_test("cxl-uffd-ratio", "femu", femu_test_cxl_uffd_ratio, NULL);
     qos_add_test("cxl-uffd-same", "femu", femu_test_cxl_uffd_same, NULL);
+    qos_add_test("cxl-cca-uffd", "femu", femu_test_cca_uffd, NULL);
+    qos_add_test("cxl-cca-uffd-same", "femu", femu_test_cca_uffd_same, NULL);
     qos_add_test("cxl-wait-uffd", "femu", femu_test_cxl_wait,
                  &(QOSGraphTestOptions) { .arg = (void *)7 });
     qos_add_test("cxl-nvme-gate-unplug", "femu", femu_test_cxl_nvme_gate,

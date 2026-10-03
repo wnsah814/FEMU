@@ -20,8 +20,7 @@ typedef struct FemuUffd FemuUffd;
 typedef struct FemuCxlDer FemuCxlDer;
 
 bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
-                     uint32_t ways, FemuCxlPolicy policy, bool cca,
-                     Error **errp);
+                     uint32_t ways, FemuCxlPolicy policy, Error **errp);
 FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                             const char **reason);
 bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner);

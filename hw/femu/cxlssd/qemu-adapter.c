@@ -1329,7 +1329,7 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
     }
     if (s->der && !strcmp(s->der, "uffd") &&
         !femu_uffd_check(ct3d->hostvmem, s->cache_pages, s->cache_ways,
-                         policy, s->cca_enabled, errp)) {
+                         policy, errp)) {
         return;
     }
     if (s->read_ns > NANOSECONDS_PER_SECOND ||
