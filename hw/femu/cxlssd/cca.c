@@ -204,7 +204,9 @@ static bool cca_walk(CcaOp *op, CcaPage page, int *status)
                 break;
             }
             scanned++;
+            femu_cxl_lock(op->s);
             *status = page(op, lpn);
+            femu_cxl_unlock(op->s);
             if (*status) {
                 done = true;
                 break;
@@ -361,8 +363,7 @@ static int cca_drop_page(CcaOp *op, uint64_t lpn)
 
 /*
  * Revoke the chunk's direct mappings in one memory transaction, then write
- * back if dirty and drop. Writeback can drop the BQL, which must not happen
- * with a transaction open.
+ * back if dirty and drop, under @cache_lock.
  */
 static int cca_drop_batch(CcaOp *op)
 {
@@ -380,6 +381,7 @@ static int cca_drop_batch(CcaOp *op)
         }
     }
     femu_cxl_der_commit(&s->direct);
+    femu_cxl_lock(s);
     for (i = 0; i < op->batch->len && !cca_abandoned(s, op->epoch); i++) {
         uint64_t lpn = g_array_index(op->batch, uint64_t, i);
         FemuCxlEntry *e = g_hash_table_lookup(c->entries, &lpn);
@@ -397,6 +399,7 @@ static int cca_drop_batch(CcaOp *op)
             op->acted++;
         }
     }
+    femu_cxl_unlock(s);
     g_array_set_size(op->batch, 0);
     return status;
 }
@@ -659,7 +662,9 @@ static void cca_apply_reset(FemuCxlMedia *s)
     if (kind == CCA_RESET_ALL) {
         femu_cxl_enter(s);
         if (s->started && !s->closing) {
+            femu_cxl_lock(s);
             femu_cxl_cache_unpin_all(&s->cache);
+            femu_cxl_unlock(s);
             g_clear_pointer(&cca->uncached_map, g_free);
             cca->uncached = 0;
         }

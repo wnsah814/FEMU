@@ -18,6 +18,8 @@ typedef struct FemuCxlWork {
 /* One access, flush or eviction chain: the media time it has accumulated. */
 typedef struct FemuCxlOp {
     FemuCxlMedia *s;
+    /* When its media work starts, in QEMU_CLOCK_REALTIME ns; zero for now. */
+    int64_t start;
     uint64_t ns;
     bool held;
     /* Pages this operation holds itself; its prefetch may evict them. */
@@ -79,6 +81,15 @@ struct FemuCxlMedia {
     bool cylon_kernel_ack;
     OnOffAuto concurrent;
     bool busy;
+    /*
+     * Lock order: BQL, then the gate, then @cache_lock, then @lock (the FTL).
+     * @cache_lock guards @cache, @pages and the hit, miss and prefetch
+     * counters; @pages also changes only under the BQL, which is what its
+     * waiters hold. Media requests made under @cache_lock run the FTL inline
+     * (see femu_cxl_media()). Never hold @cache_lock while taking the BQL,
+     * sleeping in femu_cxl_delay(), or waiting for a vCPU.
+     */
+    QemuMutex cache_lock;
     /* Accesses sharing the gate, and operations waiting to take it alone. */
     uint64_t accesses;
     uint64_t exclusive_waiters;
@@ -135,6 +146,8 @@ bool femu_cxl_concurrent(FemuCxlMedia *s);
 void femu_cxl_enter_access(FemuCxlMedia *s);
 void femu_cxl_leave_access(FemuCxlMedia *s);
 void femu_cxl_delay(uint64_t ns);
+void femu_cxl_lock(FemuCxlMedia *s);
+void femu_cxl_unlock(FemuCxlMedia *s);
 bool femu_cxl_media(FemuCxlOp *op, uint64_t lpn, bool write);
 int64_t femu_cxl_media_direct(FemuCxlMedia *s, uint64_t lpn, bool write,
                               int64_t stime);

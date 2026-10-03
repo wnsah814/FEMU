@@ -706,12 +706,14 @@ static void cxl_flush(Object *obj, bool value, Error **errp)
         goto out;
     }
     femu_cxl_der_clear(&s->direct);
+    femu_cxl_lock(s);
     /* Pinned pages are written back but stay resident. */
     if (!femu_cxl_cache_clear(&s->cache, femu_cxl_evict, &op) ||
         !femu_cxl_cache_clean_pinned(&s->cache, femu_cxl_evict, &op)) {
         error_setg(errp, "CXL cache cannot flush: NAND is full");
     }
     s->cache_entries = g_hash_table_size(s->cache.entries);
+    femu_cxl_unlock(s);
     cxl_ratio_restore(FEMU_CXL_SSD(obj), errp);
     if (op.ns) {
         femu_cxl_delay(op.ns);
@@ -727,6 +729,7 @@ static void cxl_stats_reset(Object *obj, bool value, Error **errp)
 
     object_ref(obj);
     femu_cxl_enter(s);
+    femu_cxl_lock(s);
     if (value) {
         s->snapshot[0] = s->read_hits;
         s->snapshot[1] = s->read_misses;
@@ -743,6 +746,7 @@ static void cxl_stats_reset(Object *obj, bool value, Error **errp)
         s->prefetch_inserts = 0;
         femu_cxl_cca_stats_reset(&s->cca);
     }
+    femu_cxl_unlock(s);
     femu_cxl_leave(s);
     object_unref(obj);
 }
@@ -785,14 +789,17 @@ static void cxl_runtime_set(Object *obj, Visitor *v, const char *name,
             FemuCxlOp op = { .s = s };
 
             femu_cxl_der_clear(&s->direct);
+            femu_cxl_lock(s);
             if (!femu_cxl_cache_clear(&s->cache, femu_cxl_evict, &op) ||
                 !femu_cxl_cache_clean_pinned(&s->cache, femu_cxl_evict, &op)) {
+                femu_cxl_unlock(s);
                 error_setg(errp, "CXL cache cannot rebuild: NAND is full");
                 goto out;
             }
             /* Pinned pages never left DRAM; they return without media cost. */
             femu_cxl_cache_rebuild(&s->cache, s->cache_pages, value);
             s->cache_entries = g_hash_table_size(s->cache.entries);
+            femu_cxl_unlock(s);
             cxl_ratio_restore(FEMU_CXL_SSD(obj), errp);
             if (op.ns) {
                 femu_cxl_delay(op.ns);
@@ -929,10 +936,12 @@ static void cxl_counters_clear(Object *obj)
 
     object_ref(obj);
     femu_cxl_enter(s);
+    femu_cxl_lock(s);
     s->read_hits = s->read_misses = 0;
     s->write_hits = s->write_misses = 0;
     s->cache.hits = s->cache.misses = 0;
     s->cache.inserts = s->cache.evictions = 0;
+    femu_cxl_unlock(s);
     femu_cxl_leave(s);
     object_unref(obj);
 }
@@ -1488,6 +1497,7 @@ static void cxl_init(Object *obj)
     }
     FEMU_CXL_SSD(obj)->lsa_limit = CXL_MAILBOX_MAX_PAYLOAD_SIZE;
     qemu_cond_init(&s->idle);
+    qemu_mutex_init(&s->cache_lock);
     s->pages = g_hash_table_new(g_int64_hash, g_int64_equal);
     femu_cxl_cca_init(&s->cca);
     s->der = g_strdup("off");
@@ -1692,6 +1702,7 @@ static void cxl_finalize(Object *obj)
                     g_hash_table_destroy);
     g_hash_table_destroy(FEMU_CXL_SSD(obj)->media.pages);
     qemu_cond_destroy(&FEMU_CXL_SSD(obj)->media.idle);
+    qemu_mutex_destroy(&FEMU_CXL_SSD(obj)->media.cache_lock);
     femu_cxl_cca_finalize(&FEMU_CXL_SSD(obj)->media.cca);
 }
 
