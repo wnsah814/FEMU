@@ -15965,7 +15965,8 @@ static void femu_test_cxl_wait(void *obj, void *data,
  * der=uffd under qtest: QEMU's own accesses to the window raise user-mode
  * faults, so no privilege is needed. 64 pages written through a 16-page
  * cache: 48 dirty evictions, then 16 more once never-written pages push the
- * rest out, and none for clean evictions.
+ * rest out, and none for clean evictions. A write miss is mapped writable at
+ * once; only a write to a page read first raises a write-protect fault.
  */
 static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
 {
@@ -16001,14 +16002,17 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
                         ==, 0x1000 + i);
     }
     g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 64);
-    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), >=, 64);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), ==, 0);
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 3000 * 4096), ==, 0);
+    qtest_writeq(qts, FEMU_CXL_WINDOW + 3000 * 4096, 0x3000);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), ==, 1);
 
-    /* A flush programs the one dirty resident page once. */
+    /* A flush programs the two dirty resident pages once. */
     qtest_writeq(qts, FEMU_CXL_WINDOW + 2000 * 4096, 0xf1);
     femu_cxl_set(qts, "flush-cache", true);
-    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 65);
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 66);
     femu_cxl_set(qts, "flush-cache", true);
-    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 65);
+    g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, 66);
 
     /* A configuration write unmaps the window; the next access maps it. */
     femu_cxl_config(qts, 53, PCI_COMMAND, PCI_COMMAND_MEMORY);

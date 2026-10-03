@@ -5,11 +5,12 @@
  * them in, or zapping them out of, the backend's page tables. A zapped page
  * raises a userfaultfd minor fault when anything (the guest through KVM, or
  * QEMU) touches it; the handler thread charges the miss to the FTL and resolves
- * the fault with UFFDIO_CONTINUE once the media time has passed. Pages are
- * mapped write-protected, so the first write of each residency raises a WP
- * fault that marks the page dirty. The cache, its policy, prefetch and the
- * counters are the MMIO path's (femu_cxl_lookup(), femu_cxl_fill()), shared
- * under the cache lock; the handler never takes the BQL.
+ * the fault with UFFDIO_CONTINUE once the media time has passed. A page read
+ * first is mapped write-protected, so its first write raises a WP fault that
+ * marks it dirty; a write miss is mapped writable and dirty at once. The
+ * cache, its policy, prefetch and the counters are the MMIO path's
+ * (femu_cxl_lookup(), femu_cxl_fill()), shared under the cache lock; the
+ * handler never takes the BQL.
  */
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
@@ -154,7 +155,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
 }
 
 /* Map @lpn; write-protected unless @wp is false, when writes go uncaught. */
-static void uffd_continue_mode(FemuUffd *u, uint64_t lpn, bool wp)
+static void uffd_continue(FemuUffd *u, uint64_t lpn, bool wp)
 {
     struct uffdio_continue c = {
         .range = { (uintptr_t)u->host + lpn * 4096, 4096 },
@@ -181,11 +182,6 @@ static void uffd_continue_mode(FemuUffd *u, uint64_t lpn, bool wp)
     qatomic_inc(&u->der->remaps);
 }
 
-static void uffd_continue(FemuUffd *u, uint64_t lpn)
-{
-    uffd_continue_mode(u, lpn, true);
-}
-
 /* Wake the page's waiters without mapping it, so they fault again. */
 static void uffd_wake(FemuUffd *u, uint64_t lpn)
 {
@@ -207,7 +203,7 @@ static void uffd_zap(FemuUffd *u, uint64_t lpn)
 bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn)
 {
     /* A direct ratio page goes unwatched, as with memslot. */
-    uffd_continue_mode(der->uffd_state, lpn,
+    uffd_continue(der->uffd_state, lpn,
                        !femu_cxl_ratio_selected(der->ratio, lpn));
     return true;
 }
@@ -318,7 +314,11 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
     if (t) {
         /* The fill in flight wakes every waiter; a resolved one is mapped. */
         if (t->resolved) {
-            uffd_continue(u, lpn);
+            e = g_hash_table_lookup(s->cache.entries, &lpn);
+            if (e) {
+                e->dirty |= write;
+            }
+            uffd_continue(u, lpn, !(write && e));
         }
         return;
     }
@@ -336,7 +336,8 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
      */
     e = femu_cxl_lookup(s, lpn, write, &to_media);
     if (e) {
-        uffd_continue(u, lpn);
+        e->dirty |= write;
+        uffd_continue(u, lpn, !write);
         return;
     }
     t = g_new0(UffdTimer, 1);
@@ -401,7 +402,8 @@ static void uffd_fire(FemuUffd *u, bool all)
                 g_hash_table_remove(u->pending, &t->lpn);
                 continue;
             }
-            uffd_continue(u, t->lpn);
+            /* The faulting write is the page's first: map it writable. */
+            uffd_continue(u, t->lpn, !t->write);
             t->resolved = true;
             t->due = now + UFFD_PIN_NS;
             g_queue_push_tail(&u->pins, t);

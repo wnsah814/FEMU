@@ -192,8 +192,8 @@ alias of the backend, which must be a shared, preallocated
 write protection. A page outside the cache is zapped from the backend's page
 tables (`MADV_DONTNEED`), so touching it raises a minor fault; a handler thread
 charges the miss to the FTL and resolves the fault with `UFFDIO_CONTINUE` once
-the media time has passed, write-protected, so the first write of each residency
-marks the page dirty. Hits never leave the hardware. A resolved fill stays
+the media time has passed. A page read first is mapped write-protected, so its
+first write marks it dirty; a write miss is mapped writable and dirty at once. Hits never leave the hardware. A resolved fill stays
 pinned until the thread that faulted on it faults on another page (or 1 ms), and
 a fill whose victim is pinned or still being filled waits for a slot.
 
