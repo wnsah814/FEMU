@@ -216,9 +216,15 @@ replaces is dropped from the cache and zapped while the window stays mapped; a
 fill in flight for it wakes its thread, which faults again
 (`uffd-dropped-fills`). Caching API commands work the same way: they change the
 cache under the lock and zap the pages they drop, so they give the same
-counters and QUERY answers as under `der=off` (qtest `cxl-cca-uffd-same`). An
-uncached range's pages are zapped too; an access to one faults and is charged
-as an uncached access, but only once until its thread moves on.
+counters and QUERY answers as under `der=off` (qtest `cxl-cca-uffd-same`). The
+alias would serve an uncached page at DRAM speed, so each run of uncached pages
+is carved out of it with an alias of the device's MMIO region, and every access
+there is charged, as under `der=off` (qtest `cxl-cca-uffd-uncached`). Each run
+splits a KVM slot, so `CACHE_DISABLE` and `CACHE_ENABLE` fail with `-ENOSPC`
+when the uncached map would have more than 64 runs or more than the free KVM
+slots allow. Each change also drops the window's EPT entries; the pages stay
+mapped in QEMU, so the guest's next access to each takes an EPT fault in the
+host kernel, not a userfault, and no counter sees it.
 
 What the device is configured with and `der=uffd` cannot model fails realize,
 and the error names a mode that can: a backend other than a shared,

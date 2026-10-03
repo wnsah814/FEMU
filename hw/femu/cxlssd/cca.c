@@ -520,6 +520,10 @@ static int cca_prepare(CcaOp *op)
         if (s->direct.ratio) {
             return -EBUSY;
         }
+        if (!femu_cxl_der_holes_fit(&s->direct, cca->uncached_map, op->start,
+                                    op->end, true)) {
+            return -ENOSPC;
+        }
         /* fall through */
     case CCA_CTRL_INVALIDATE:
         if (!(op->cmd.flags & CCA_F_FORCE) &&
@@ -546,6 +550,12 @@ static int cca_prepare(CcaOp *op)
                     CCA_CLEAR && s->direct.mapped;
         return 0;
     case CCA_CTRL_CACHE_ENABLE:
+        /* Re-enabling the middle of a range splits it in two. */
+        if (!(op->cmd.flags & CCA_F_ALL) &&
+            !femu_cxl_der_holes_fit(&s->direct, cca->uncached_map, op->start,
+                                    op->end, false)) {
+            return -ENOSPC;
+        }
         before = cca_uncached_count(cca, op->start, op->end);
         if (before) {
             bitmap_clear(cca->uncached_map, op->start, count);
@@ -612,6 +622,7 @@ static void cca_disable_undo(CcaOp *op)
         g_clear_pointer(&cca->uncached_map, g_free);
     }
     femu_cxl_unlock(s);
+    femu_cxl_der_holes(&s->direct);
     femu_cxl_leave(s);
 }
 
@@ -640,6 +651,10 @@ static bool cca_exec(FemuCxlMedia *s, CcaOp *op, struct cca_ctrl_resp_s *resp)
         femu_cxl_unlock(s);
         if (op->clear) {
             femu_cxl_der_clear(&s->direct);
+        }
+        if (status >= 0 && (op->cmd.cmd == CCA_CTRL_CACHE_DISABLE ||
+                            op->cmd.cmd == CCA_CTRL_CACHE_ENABLE)) {
+            femu_cxl_der_holes(&s->direct);
         }
         cca_leave(op);
         if (status == 1) {
@@ -688,6 +703,7 @@ static void cca_apply_reset(FemuCxlMedia *s)
             g_clear_pointer(&cca->uncached_map, g_free);
             cca->uncached = 0;
             femu_cxl_unlock(s);
+            femu_cxl_der_holes(&s->direct);
         }
         femu_cxl_leave(s);
     }

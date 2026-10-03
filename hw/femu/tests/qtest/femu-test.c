@@ -18071,6 +18071,55 @@ static void femu_test_cca_uffd(void *obj, void *data, QGuestAllocator *alloc)
     femu_cca_quit(&c);
 }
 
+/*
+ * An uncached range under der=uffd is carved out of the mapped window, so
+ * every access to it is charged, as under der=off, while other pages stay
+ * direct. Enabling it again maps it with the rest.
+ */
+static void femu_test_cca_uffd_uncached(void *obj, void *data,
+                                        QGuestAllocator *alloc)
+{
+    const char *ders[] = { "off", "uffd" };
+    uint64_t reads[2];
+    unsigned d, i;
+
+    for (d = 0; d < 2; d++) {
+        g_autofree char *options = g_strdup_printf(
+            "volatile-memdev=umem,der=%s,cache-pages=16,cache-ways=4",
+            ders[d]);
+        uint64_t before, faults;
+        FemuCca c;
+
+        femu_cca_start(&c, FEMU_UFFD_MEMFD, options);
+        qtest_writeq(c.qts, femu_cca_page(3), 0x33);
+        if (d && !femu_cxl_active(c.qts)) {
+            g_test_skip("userfaultfd minor faults on shmem are unavailable");
+            femu_cca_quit(&c);
+            return;
+        }
+        femu_cca_expect(&c, CCA_CTRL_CACHE_DISABLE, 0, 2, 2, 0, 2);
+        before = femu_cxl_stat(c.qts, "media-reads");
+        for (i = 0; i < 10; i++) {
+            g_assert_cmphex(qtest_readq(c.qts, femu_cca_page(3)), ==, 0x33);
+        }
+        reads[d] = femu_cxl_stat(c.qts, "media-reads") - before;
+        g_assert_cmpuint(reads[d], ==, 10);
+        if (d) {
+            g_assert_true(femu_cxl_active(c.qts));
+            qtest_readq(c.qts, femu_cca_page(5));
+            faults = femu_cxl_stat(c.qts, "uffd-faults");
+            qtest_readq(c.qts, femu_cca_page(5));
+            g_assert_cmpuint(femu_cxl_stat(c.qts, "uffd-faults"), ==, faults);
+        }
+        femu_cca_expect(&c, CCA_CTRL_CACHE_ENABLE, 0, 2, 2, 0, 2);
+        before = femu_cxl_stat(c.qts, "media-reads");
+        qtest_readq(c.qts, femu_cca_page(3));
+        qtest_readq(c.qts, femu_cca_page(3));
+        g_assert_cmpuint(femu_cxl_stat(c.qts, "media-reads"), ==, before + 1);
+        femu_cca_quit(&c);
+    }
+}
+
 static const char *const femu_cca_same_stats[] = {
     "read-misses", "write-misses", "cache-inserts", "cache-evictions",
     "prefetch-inserts", "media-reads", "media-writes", "cca-pin-fills",
@@ -20970,6 +21019,8 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-uffd-same", "femu", femu_test_cxl_uffd_same, NULL);
     qos_add_test("cxl-cca-uffd", "femu", femu_test_cca_uffd, NULL);
     qos_add_test("cxl-cca-uffd-same", "femu", femu_test_cca_uffd_same, NULL);
+    qos_add_test("cxl-cca-uffd-uncached", "femu", femu_test_cca_uffd_uncached,
+                 NULL);
     qos_add_test("cxl-wait-uffd", "femu", femu_test_cxl_wait,
                  &(QOSGraphTestOptions) { .arg = (void *)7 });
     qos_add_test("cxl-nvme-gate-unplug", "femu", femu_test_cxl_nvme_gate,

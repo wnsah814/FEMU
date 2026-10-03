@@ -569,6 +569,19 @@ static void adapter_machine_done(Notifier *notifier, void *opaque)
     g_slist_free(windows);
 }
 
+/* The device's MMIO region in @fw, which serves what no mapping covers. */
+MemoryRegion *femu_cxl_window_io(CXLFixedWindow *fw)
+{
+    FemuCxlWindow *w;
+
+    QLIST_FOREACH(w, &adapter_windows, next) {
+        if (w->fw == fw) {
+            return &w->io;
+        }
+    }
+    return NULL;
+}
+
 static void adapter_detach(FemuCxlSsd *dev)
 {
     qemu_remove_machine_init_done_notifier(&dev->machine_done);
@@ -2372,6 +2385,21 @@ bool femu_cxl_der_busy(FemuCxlDer *der, uint64_t lpn)
     return der->ops->busy && der->ops->busy(der, lpn);
 }
 
+bool femu_cxl_der_holes_fit(FemuCxlDer *der, const unsigned long *map,
+                            uint64_t start, uint64_t end, bool set)
+{
+    return !der->ops->holes_fit ||
+           der->ops->holes_fit(der, map, start, end, set);
+}
+
+/* Called with the BQL and the gate, not under the cache lock. */
+void femu_cxl_der_holes(FemuCxlDer *der)
+{
+    if (der->ops->holes) {
+        der->ops->holes(der);
+    }
+}
+
 /*
  * Whether a direct ratio page was written since the last sample. Memslot
  * cannot tell and keeps such entries dirty; Cylon reads the EPT dirty bit
@@ -2468,6 +2496,8 @@ static const FemuCxlDerOps der_uffd_ops = {
     .sample = uffd_sample,
     .busy = femu_uffd_busy,
     .flush = uffd_flush,
+    .holes_fit = femu_uffd_holes_fit,
+    .holes = femu_uffd_holes,
 };
 
 void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,

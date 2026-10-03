@@ -65,6 +65,9 @@ struct FemuUffd {
     MemoryRegion alias;
     MemoryRegion *container;    /* where the alias was added, once */
     uint64_t base;              /* the window's HPA */
+    MemoryRegion *io;           /* the device's MMIO region in the window */
+    GPtrArray *holes;           /* UffdHole, one per run of uncached pages */
+    bool holes_over;            /* too many runs: the window stays unmapped */
     bool installed;
     QemuThread thread;
     GHashTable *pending;        /* lpn -> UffdTimer, pages not yet evictable */
@@ -73,6 +76,15 @@ struct FemuUffd {
     GHashTable *pinned;         /* tid -> its resolved, pinned fill */
     GQueue deferred;            /* read fills waiting for a slot */
 };
+
+/* A run of uncached pages that MMIO serves, so each access is charged. */
+typedef struct UffdHole {
+    struct rcu_head rcu;
+    MemoryRegion mr;
+} UffdHole;
+
+/* Uncached runs need a KVM slot each; leave the rest for other regions. */
+#define UFFD_HOLES_MAX 64
 
 static int64_t now_ns(void)
 {
@@ -183,6 +195,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
     g_queue_init(&u->pins);
     u->pinned = g_hash_table_new(NULL, NULL);
     g_queue_init(&u->deferred);
+    u->holes = g_ptr_array_new();
     return u;
 }
 
@@ -245,6 +258,123 @@ void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
 {
     if (femu_uffd_installed(der)) {
         uffd_zap(der->uffd_state, lpn);
+    }
+}
+
+static void uffd_holes_clear(FemuUffd *u)
+{
+    while (u->holes->len) {
+        UffdHole *h = g_ptr_array_steal_index_fast(u->holes, 0);
+
+        memory_region_del_subregion(u->container, &h->mr);
+        object_unparent(OBJECT(&h->mr));
+        /* A reader on the previous flat view may still reach the region. */
+        g_free_rcu(h, rcu);
+    }
+}
+
+static uint64_t uffd_runs(const unsigned long *map, uint64_t pages)
+{
+    uint64_t runs = 0;
+    uint64_t lpn = 0;
+
+    while (map && (lpn = find_next_bit(map, pages, lpn)) < pages) {
+        lpn = find_next_zero_bit(map, pages, lpn);
+        runs++;
+    }
+    return runs;
+}
+
+/* Each hole splits a KVM slot; leave room for the rest of the machine. */
+static bool uffd_holes_room(uint64_t runs)
+{
+    uint64_t slots = UFFD_HOLES_MAX;
+
+#ifdef CONFIG_KVM
+    if (kvm_enabled()) {
+        unsigned free = kvm_get_free_memslots();
+
+        slots = MIN(slots, free > 8 ? free - 8 : 0);
+    }
+#endif
+    return runs <= slots;
+}
+
+/*
+ * Whether the uncached map, with [start, end) set or cleared, leaves few
+ * enough runs to carve out of the window.
+ */
+bool femu_uffd_holes_fit(FemuCxlDer *der, const unsigned long *map,
+                         uint64_t start, uint64_t end, bool set)
+{
+    FemuUffd *u = der->uffd_state;
+    g_autofree unsigned long *after = NULL;
+    uint64_t pages;
+
+    if (!u) {
+        return true;
+    }
+    pages = u->size / 4096;
+    after = bitmap_new(pages);
+    if (map) {
+        bitmap_copy(after, map, pages);
+    }
+    if (set) {
+        bitmap_set(after, start, end - start);
+    } else {
+        bitmap_clear(after, start, end - start);
+    }
+    return uffd_holes_room(uffd_runs(after, pages));
+}
+
+/* Carve each run of the uncached map out of the alias; in a transaction. */
+static void uffd_holes_add(FemuUffd *u, const unsigned long *map)
+{
+    uint64_t pages = u->size / 4096;
+    uint64_t lpn = 0;
+
+    while (map && (lpn = find_next_bit(map, pages, lpn)) < pages) {
+        uint64_t end = find_next_zero_bit(map, pages, lpn);
+        UffdHole *h = g_new0(UffdHole, 1);
+
+        memory_region_init_alias(&h->mr, u->container->owner,
+                                 "femu-cxl-uffd-hole", u->io, lpn * 4096,
+                                 (end - lpn) * 4096);
+        memory_region_add_subregion_overlap(u->container, lpn * 4096, &h->mr,
+                                            2);
+        g_ptr_array_add(u->holes, h);
+        lpn = end;
+    }
+}
+
+/*
+ * The alias would serve an uncached page at DRAM speed, so each run of
+ * uncached pages is carved out of it with an alias of the device's own MMIO
+ * region, above it, and every access there is charged. Called after the
+ * uncached map changed, with the BQL and the gate but not the cache lock: a
+ * KVM slot change waits for vCPUs, which may wait for the handler. The
+ * change also drops the window's EPT entries, which the kernel refills from
+ * QEMU's mapping without a userfault. Runs beyond the slots left unmap the
+ * window until they fit again.
+ */
+void femu_uffd_holes(FemuCxlDer *der)
+{
+    FemuUffd *u = der->uffd_state;
+    const unsigned long *map =
+        container_of(der, FemuCxlMedia, direct)->cca.uncached_map;
+
+    if (!u || !u->container) {
+        return;
+    }
+    memory_region_transaction_begin();
+    uffd_holes_clear(u);
+    u->holes_over = !uffd_holes_room(uffd_runs(map, u->size / 4096));
+    if (!u->holes_over) {
+        uffd_holes_add(u, map);
+    }
+    memory_region_transaction_commit();
+    if (u->holes_over) {
+        femu_uffd_uninstall(der);
     }
 }
 
@@ -649,7 +779,14 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
         der->fallbacks++;
         return false;
     }
-    if (fw->size != u->size || (u->container && u->container != &fw->mr)) {
+    if (u->holes_over &&
+        !uffd_holes_room(uffd_runs(uffd_media(u)->cca.uncached_map,
+                                   u->size / 4096))) {
+        der->fallbacks++;
+        return false;
+    }
+    if (fw->size != u->size || (u->container && u->container != &fw->mr) ||
+        !femu_cxl_window_io(fw)) {
         femu_cxl_der_fallback(der, "uffd maps one whole window onto the "
                               "backend");
         femu_uffd_destroy(der);
@@ -671,15 +808,26 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
     uffd_check_guest();
     qemu_thread_create(&u->thread, "femu-cxl-uffd", uffd_thread, u,
                        QEMU_THREAD_JOINABLE);
+    /*
+     * The alias and its holes appear in one transaction: until it commits no
+     * KVM slot covers the window, so no vCPU waits in a fault while it does,
+     * even though the caller may hold the cache lock.
+     */
+    memory_region_transaction_begin();
     if (!u->container) {
         memory_region_init_alias(&u->alias, owner, "femu-cxl-uffd", u->ram, 0,
                                  u->size);
         memory_region_add_subregion_overlap(&fw->mr, 0, &u->alias, 1);
         u->container = &fw->mr;
         u->base = fw->base;
+        u->io = femu_cxl_window_io(fw);
     } else {
         memory_region_set_enabled(&u->alias, true);
     }
+    uffd_holes_clear(u);
+    uffd_holes_add(u, uffd_media(u)->cca.uncached_map);
+    u->holes_over = false;
+    memory_region_transaction_commit();
     u->installed = true;
     der->available = true;
     qatomic_inc(&der->remaps);
@@ -741,9 +889,13 @@ void femu_uffd_destroy(FemuCxlDer *der)
     }
     femu_uffd_uninstall(der);
     if (u->container) {
+        memory_region_transaction_begin();
+        uffd_holes_clear(u);
         memory_region_del_subregion(u->container, &u->alias);
+        memory_region_transaction_commit();
         object_unparent(OBJECT(&u->alias));
     }
+    g_ptr_array_free(u->holes, true);
     close(u->fd);
     close(u->stop);
     g_queue_clear(&u->timers);
@@ -800,6 +952,16 @@ void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
 bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn)
 {
     return false;
+}
+
+bool femu_uffd_holes_fit(FemuCxlDer *der, const unsigned long *map,
+                         uint64_t start, uint64_t end, bool set)
+{
+    return true;
+}
+
+void femu_uffd_holes(FemuCxlDer *der)
+{
 }
 
 void femu_uffd_uninstall(FemuCxlDer *der)

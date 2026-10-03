@@ -34,6 +34,14 @@ typedef struct FemuCxlDerOps {
     /* Bracket a batch of unmaps; optional. */
     void (*begin)(FemuCxlDer *der);
     void (*commit)(FemuCxlDer *der);
+    /*
+     * For a backend that maps pages the cache does not hold: whether the
+     * uncached map with [start, end) set or cleared can still be served,
+     * and making its pages reach the device again after it changed.
+     */
+    bool (*holes_fit)(FemuCxlDer *der, const unsigned long *map,
+                      uint64_t start, uint64_t end, bool set);
+    void (*holes)(FemuCxlDer *der);
     /* Map or revoke a direct ratio as a whole; optional. */
     bool (*ratio_map)(FemuCxlSsd *dev, Error **errp);
     void (*ratio_revoke)(FemuCxlDer *der);
@@ -133,6 +141,9 @@ void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn);
 bool femu_cxl_der_sample(FemuCxlDer *der, uint64_t lpn);
 void femu_cxl_der_clear(FemuCxlDer *der);
 bool femu_cxl_der_busy(FemuCxlDer *der, uint64_t lpn);
+bool femu_cxl_der_holes_fit(FemuCxlDer *der, const unsigned long *map,
+                            uint64_t start, uint64_t end, bool set);
+void femu_cxl_der_holes(FemuCxlDer *der);
 void femu_cxl_der_begin(FemuCxlDer *der);
 void femu_cxl_der_commit(FemuCxlDer *der);
 void femu_cxl_der_disable(FemuCxlDer *der);
