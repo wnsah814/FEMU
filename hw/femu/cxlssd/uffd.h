@@ -9,10 +9,11 @@
 /*
  * One instruction may need several pages mapped at once: a string copy
  * between CXL buffers, an access across a page boundary, code or page tables
- * on the device. Filling the last must not evict the others, as LIFO does
- * (its victim is the newest entry) and a small set does when they share it;
- * the instruction would fault on them in turn forever. Four ways cover code,
- * source, destination and a page-table page: a rule of thumb, not a bound.
+ * on the device. A hold keeps such an instruction going whatever the cache
+ * (see UffdThread in uffd.c), but at the cost of misses der=off would not
+ * charge. LIFO, whose victim is the newest entry, and sets of fewer than four
+ * ways (code, source, destination and a page-table page) would put most such
+ * instructions into a hold, so they are refused.
  */
 #define FEMU_UFFD_MIN_WAYS 4
 

@@ -15943,9 +15943,12 @@ static void femu_test_cxl_wait(void *obj, void *data,
         }
         g_assert_true(femu_cxl_active(qts));
         g_assert_cmpuint(femu_cxl_stat(qts, "uffd-faults"), ==, 0);
-        /* The write's page is resident: one fault, continued. */
+        /*
+         * The write's page is resident: a fault, continued (twice if a
+         * signal made the thread retry it).
+         */
         g_assert_cmphex(qtest_readb(qts, FEMU_CXL_WINDOW), ==, 0x5a);
-        g_assert_cmpuint(femu_cxl_stat(qts, "uffd-faults"), ==, 1);
+        g_assert_cmpuint(femu_cxl_stat(qts, "uffd-faults"), >=, 1);
     } else if (data) {
         /* A concurrent access must queue, not trip the IO recursion guard. */
         g_assert_cmpuint(qtest_readb(qts, FEMU_CXL_WINDOW), ==, 0x5a);
@@ -16005,7 +16008,7 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
     g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), ==, 0);
     g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 3000 * 4096), ==, 0);
     qtest_writeq(qts, FEMU_CXL_WINDOW + 3000 * 4096, 0x3000);
-    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), ==, 1);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-wp-faults"), >=, 1);
 
     /* A flush programs the two dirty resident pages once. */
     qtest_writeq(qts, FEMU_CXL_WINDOW + 2000 * 4096, 0xf1);
@@ -16266,6 +16269,61 @@ static void femu_test_cxl_uffd_prefetch(void *obj, void *data,
     femu_cxl_set(qts, "flush-cache", true);
     g_assert_cmpuint(femu_cxl_stat(qts, "media-writes"), ==, writes + 1);
     g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 103 * 4096), ==, 0xfeed);
+    femu_cxl_set(qts, "realized", false);
+    qtest_quit(qts);
+}
+
+/*
+ * A thread that loses a page it faulted on lately twice enters a hold: its
+ * recent cached pages stay, and a fill with no other victim is mapped without
+ * a slot until the thread goes quiet. Five pages cycled through a 4-page cache
+ * look like one instruction that needs them all.
+ */
+static void femu_test_cxl_uffd_hold(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    QTestState *qts = qtest_init(
+        "-machine q35,cxl=on -m 128M "
+        "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 "
+        "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
+        "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on "
+        "-device femu-cxl-ssd,id=ssd,bus=rp0,volatile-memdev=mem,"
+        "cache-pages=4,cache-ways=4,der=uffd,read-ns=1000,program-ns=1000");
+    uint64_t misses, i;
+
+    femu_cxl_decode(qts);
+    qtest_readq(qts, FEMU_CXL_WINDOW);
+    if (!femu_cxl_active(qts)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        qtest_quit(qts);
+        return;
+    }
+    for (i = 10; i < 15; i++) {
+        qtest_writeq(qts, FEMU_CXL_WINDOW + i * 4096, i);
+    }
+    /* Each page of the first pass evicts the one before it. */
+    for (i = 10; i < 15; i++) {
+        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + i * 4096), ==, i);
+    }
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-holds"), ==, 0);
+    /*
+     * Page 10 is lost a second time: a hold keeps 11 to 14, and 10 is mapped
+     * without a slot, so the pass misses on that one only. A fault retried
+     * after a signal is counted twice, so count misses rather than faults.
+     */
+    misses = femu_cxl_stat(qts, "cache-misses");
+    for (i = 10; i < 15; i++) {
+        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + i * 4096), ==, i);
+    }
+    g_assert_cmpuint(femu_cxl_stat(qts, "cache-misses"), ==, misses + 1);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-holds"), ==, 1);
+    g_assert_cmpuint(femu_cxl_stat(qts, "uffd-transient-fills"), ==, 1);
+    /* Quiet for 1 ms, the hold ends and the slotless page misses again. */
+    g_usleep(20 * 1000);
+    misses = femu_cxl_stat(qts, "cache-misses");
+    g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW + 10 * 4096), ==, 10);
+    g_assert_cmpuint(femu_cxl_stat(qts, "cache-misses"), ==, misses + 1);
     femu_cxl_set(qts, "realized", false);
     qtest_quit(qts);
 }
@@ -21017,6 +21075,7 @@ static void femu_register_nodes(void)
                  NULL);
     qos_add_test("cxl-uffd-ratio", "femu", femu_test_cxl_uffd_ratio, NULL);
     qos_add_test("cxl-uffd-same", "femu", femu_test_cxl_uffd_same, NULL);
+    qos_add_test("cxl-uffd-hold", "femu", femu_test_cxl_uffd_hold, NULL);
     qos_add_test("cxl-cca-uffd", "femu", femu_test_cca_uffd, NULL);
     qos_add_test("cxl-cca-uffd-same", "femu", femu_test_cca_uffd_same, NULL);
     qos_add_test("cxl-cca-uffd-uncached", "femu", femu_test_cca_uffd_uncached,

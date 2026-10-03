@@ -197,6 +197,24 @@ first write marks it dirty; a write miss is mapped writable and dirty at once. H
 pinned until the thread that faulted on it faults on another page (or 1 ms), and
 a fill whose victim is pinned or still being filled waits for a slot.
 
+One instruction can need more pages mapped at once than a set has ways: code,
+operands and page tables on the device, each perhaps across a page boundary.
+Filling the last page evicts the first, and the instruction faults on them in
+turn forever. The handler keeps the last 16 pages each thread faulted on; a
+thread that loses one of them twice, with no fault on a page new to it in
+between, is going round such a set and enters a hold (`uffd-holds`), in which
+its recent pages that are cached cannot be evicted, and a fill that then finds
+no victim is mapped without a cache slot and charged as an uncached access
+(`uffd-transient-fills`). A thread that keeps reaching new pages is only
+thrashing a small cache, which `der=off` would charge the same way. The hold
+ends when the thread goes 1 ms without a fault, or after 16 faults with no loss,
+and its slotless pages are zapped. A
+`movsq` whose code, source and destination each straddle a page boundary needs
+six pages; with a 4-page cache it never completed before (0 of 50 in 30 s), and
+completes in about 0.6 ms with the hold (`hw/femu/tools/uffd`). LIFO
+and sets under 4 ways would put most multi-page instructions into a hold, with
+misses `der=off` would not charge, so they are still refused.
+
 The cache, its policy, prefetch and the counters are the MMIO path's: the
 handler and MMIO accesses share them under one lock, so the same accesses give
 the same misses, fills, evictions and media work as under `der=off` (qtest

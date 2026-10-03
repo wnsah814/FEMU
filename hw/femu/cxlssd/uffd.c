@@ -37,10 +37,41 @@
  * A resolved fill pins its page until the thread that faulted on it faults on
  * another page, or at most this long, so a later fill cannot zap the page
  * before the woken thread gets to it. The pin covers only the page the thread
- * waited for: an instruction that needs several pages keeps the earlier ones
- * only if filling the next does not evict them (see femu_uffd_prepare()).
+ * waited for; an instruction that needs several pages keeps the earlier ones
+ * through a hold (see UffdThread).
  */
 #define UFFD_PIN_NS 1000000
+
+/*
+ * The pages a thread faulted on lately. One instruction can need more pages
+ * at once than a set has ways (code, operands and page tables, each across a
+ * page boundary): filling the last evicts the first, and the instruction
+ * faults on them in turn forever. A thread that loses a recent page twice
+ * with no fault on a page new to it in between is going round such a set,
+ * and enters a hold: its recent pages that are cached cannot be evicted, and
+ * a fill that then finds no victim is mapped without a slot (transient),
+ * charged as an uncached access. A thread that keeps reaching new pages is
+ * only thrashing a small cache, which der=off would charge the same. The
+ * hold ends when the thread goes UFFD_PIN_NS without a fault, or after
+ * UFFD_RECENT faults with no loss; its transient pages are then zapped.
+ */
+#define UFFD_RECENT 16
+
+typedef struct UffdThread {
+    uint32_t tid;
+    struct {
+        uint64_t lpn;
+        bool lost;
+        uint64_t fresh;         /* @fresh when it was last lost */
+    } recent[UFFD_RECENT];
+    unsigned next;              /* the ring slot to overwrite */
+    unsigned used;
+    uint64_t fresh;             /* faults on pages not in the ring */
+    int64_t last;               /* the thread's last fault */
+    unsigned since;             /* faults since the hold began or last lost */
+    bool hold;
+    GQueue transients;          /* UffdTimer, mapped until the hold ends */
+} UffdThread;
 
 typedef struct UffdTimer {
     uint64_t lpn;
@@ -75,6 +106,8 @@ struct FemuUffd {
     GQueue pins;                /* resolved fills still pinned, by due time */
     GHashTable *pinned;         /* tid -> its resolved, pinned fill */
     GQueue deferred;            /* read fills waiting for a slot */
+    GHashTable *threads;        /* tid -> UffdThread */
+    unsigned holding;           /* threads in a hold */
 };
 
 /* A run of uncached pages that MMIO serves, so each access is charged. */
@@ -196,6 +229,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
     u->pinned = g_hash_table_new(NULL, NULL);
     g_queue_init(&u->deferred);
     u->holes = g_ptr_array_new();
+    u->threads = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     return u;
 }
 
@@ -378,12 +412,125 @@ void femu_uffd_holes(FemuCxlDer *der)
     }
 }
 
-/* A page still being filled, or pinned for its thread, is no victim. */
+static UffdThread *uffd_thread_get(FemuUffd *u, uint32_t tid)
+{
+    UffdThread *th = g_hash_table_lookup(u->threads, GUINT_TO_POINTER(tid));
+
+    if (!th) {
+        th = g_new0(UffdThread, 1);
+        th->tid = tid;
+        g_queue_init(&th->transients);
+        g_hash_table_insert(u->threads, GUINT_TO_POINTER(tid), th);
+    }
+    return th;
+}
+
+static int uffd_recent(UffdThread *th, uint64_t lpn)
+{
+    for (unsigned i = 0; i < th->used; i++) {
+        if (th->recent[i].lpn == lpn) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void uffd_hold_end(FemuUffd *u, UffdThread *th)
+{
+    UffdTimer *t;
+
+    th->hold = false;
+    u->holding--;
+    th->used = th->next = 0;
+    while ((t = g_queue_pop_head(&th->transients))) {
+        uffd_zap(u, t->lpn);
+        g_hash_table_remove(u->pending, &t->lpn);
+    }
+}
+
+/* End the holds whose thread went quiet; with @all, every hold. */
+static bool uffd_holds_release(FemuUffd *u, int64_t now, bool all)
+{
+    GHashTableIter it;
+    gpointer value;
+    bool freed = false;
+
+    if (!u->holding) {
+        return false;
+    }
+    g_hash_table_iter_init(&it, u->threads);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        UffdThread *th = value;
+
+        if (th->hold && (all || th->last + UFFD_PIN_NS <= now)) {
+            uffd_hold_end(u, th);
+            freed = true;
+        }
+    }
+    return freed;
+}
+
+/*
+ * Note @tid's fault on @lpn, which the cache does not hold: a recent page
+ * lost again with no new page faulted on since puts the thread in a hold.
+ */
+static void uffd_note_miss(FemuUffd *u, uint32_t tid, uint64_t lpn)
+{
+    UffdThread *th = uffd_thread_get(u, tid);
+    int i = uffd_recent(th, lpn);
+
+    if (i < 0) {
+        th->recent[th->next].lpn = lpn;
+        th->recent[th->next].lost = false;
+        th->next = (th->next + 1) % UFFD_RECENT;
+        th->used = MAX(th->used, th->next ? th->next : UFFD_RECENT);
+        th->fresh++;
+    } else if (th->recent[i].lost && th->recent[i].fresh == th->fresh) {
+        if (!th->hold) {
+            th->hold = true;
+            u->holding++;
+            u->der->uffd_holds++;
+        }
+        th->since = 0;
+    } else {
+        th->recent[i].lost = true;
+        th->recent[i].fresh = th->fresh;
+    }
+    if (th->hold && ++th->since > UFFD_RECENT) {
+        uffd_hold_end(u, th);
+    }
+}
+
+/* Whether a thread in a hold still needs @lpn. */
+static bool uffd_held(FemuUffd *u, uint64_t lpn)
+{
+    GHashTableIter it;
+    gpointer value;
+
+    if (!u->holding) {
+        return false;
+    }
+    g_hash_table_iter_init(&it, u->threads);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        UffdThread *th = value;
+
+        if (th->hold && uffd_recent(th, lpn) >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A page still being filled, pinned for its thread, or held for an
+ * instruction that needs it is no victim.
+ */
 bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn)
 {
     FemuUffd *u = der->uffd_state;
 
-    if (u && u->installed && g_hash_table_contains(u->pending, &lpn)) {
+    if (u && u->installed &&
+        (g_hash_table_contains(u->pending, &lpn) || uffd_held(u, lpn))) {
         der->uffd_pending_victims++;
         return true;
     }
@@ -400,11 +547,17 @@ static gint timer_cmp(gconstpointer a, gconstpointer b, gpointer unused)
 static void uffd_unpin(FemuUffd *u, UffdTimer *t)
 {
     gpointer tid = GUINT_TO_POINTER(t->tid);
+    UffdThread *th = g_hash_table_lookup(u->threads, tid);
 
     if (g_hash_table_lookup(u->pinned, tid) == t) {
         g_hash_table_remove(u->pinned, tid);
     }
     g_queue_remove(&u->pins, t);
+    if (t->transient && th && th->hold) {
+        /* The instruction may still need it: keep it until the hold ends. */
+        g_queue_push_tail(&th->transients, t);
+        return;
+    }
     if (t->transient) {
         uffd_zap(u, t->lpn);
     }
@@ -440,10 +593,17 @@ static void uffd_place(FemuUffd *u, UffdTimer *t)
     int64_t start = now_ns();
 
     if (!t->transient && !femu_cxl_fill(&op, t->lpn, t->write, u->base)) {
-        if (op.held) {
+        UffdThread *th = g_hash_table_lookup(u->threads,
+                                             GUINT_TO_POINTER(t->tid));
+
+        /* A held instruction would wait for its own pages forever. */
+        if (op.held && !(th && th->hold)) {
             g_queue_push_tail(&u->deferred, t);
             u->der->uffd_ns_ftl += now_ns() - start;
             return;
+        }
+        if (op.held) {
+            u->der->uffd_transient_fills++;
         }
         t->transient = true;
     }
@@ -517,6 +677,7 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
         uffd_continue(u, lpn, !write);
         return;
     }
+    uffd_note_miss(u, tid, lpn);
     t = g_new0(UffdTimer, 1);
     t->lpn = lpn;
     t->tid = tid;
@@ -593,6 +754,7 @@ static void uffd_fire(FemuUffd *u, bool all)
             }
             g_hash_table_insert(u->pinned, GUINT_TO_POINTER(t->tid), t);
         }
+        freed |= uffd_holds_release(u, now, all);
         /* A fill may also wait for a page an MMIO access held. */
         if (uffd_release(u, now, all) || freed || u->deferred.length) {
             uffd_retry(u);
@@ -601,15 +763,39 @@ static void uffd_fire(FemuUffd *u, bool all)
 }
 
 /*
- * When the next fill or pin is due: a pin's end frees a slot for a deferred
- * fill, and zaps a page served without a slot.
+ * When the next fill or pin is due (a pin's end frees a slot for a deferred
+ * fill, and zaps a page served without a slot), or a hold ends; INT64_MAX if
+ * none.
  */
-static UffdTimer *uffd_next(FemuUffd *u)
+static int64_t uffd_next(FemuUffd *u)
 {
     UffdTimer *t = g_queue_peek_head(&u->timers);
     UffdTimer *g = g_queue_peek_head(&u->pins);
+    int64_t due = t ? t->due : INT64_MAX;
+    GHashTableIter it;
+    gpointer value;
 
-    return g && (!t || g->due < t->due) ? g : t;
+    if (g) {
+        due = MIN(due, g->due);
+    }
+    /*
+     * A fill may wait for a victim that an MMIO access holds, which no
+     * timer here ends: look again at least every pin's time.
+     */
+    if (u->deferred.length) {
+        due = MIN(due, now_ns() + UFFD_PIN_NS);
+    }
+    if (u->holding) {
+        g_hash_table_iter_init(&it, u->threads);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            UffdThread *th = value;
+
+            if (th->hold) {
+                due = MIN(due, th->last + UFFD_PIN_NS);
+            }
+        }
+    }
+    return due;
 }
 
 static void *uffd_thread(void *opaque)
@@ -623,23 +809,15 @@ static void *uffd_thread(void *opaque)
             { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 },
         };
         struct timespec ts, *tsp = NULL;
-        UffdTimer *t;
+        int64_t due;
         int64_t busy;
         uint64_t faults = 0;
         ssize_t n;
 
         femu_cxl_lock(s);
-        t = uffd_next(u);
-        /*
-         * A fill may wait for a victim that an MMIO access holds, which no
-         * timer here ends: look again at least every pin's time.
-         */
-        if (t || u->deferred.length) {
-            int64_t wait = t ? MAX(0, t->due - now_ns()) : UFFD_PIN_NS;
-
-            if (u->deferred.length) {
-                wait = MIN(wait, UFFD_PIN_NS);
-            }
+        due = uffd_next(u);
+        if (due != INT64_MAX) {
+            int64_t wait = MAX(0, due - now_ns());
 
             ts.tv_sec = wait / NANOSECONDS_PER_SECOND;
             ts.tv_nsec = wait % NANOSECONDS_PER_SECOND;
@@ -664,6 +842,7 @@ static void *uffd_thread(void *opaque)
                 }
                 faults++;
                 lpn = (m[i].arg.pagefault.address - (uintptr_t)u->host) / 4096;
+                uffd_thread_get(u, tid)->last = now_ns();
                 /* A thread faulting elsewhere has made its access. */
                 pin = g_hash_table_lookup(u->pinned, GUINT_TO_POINTER(tid));
                 if (pin && pin->lpn != lpn) {
@@ -864,6 +1043,8 @@ void femu_uffd_uninstall(FemuCxlDer *der)
     while ((t = g_queue_pop_head(&u->deferred))) {
         g_hash_table_remove(u->pending, &t->lpn);
     }
+    /* Every hold ended above; start the next install with no history. */
+    g_hash_table_remove_all(u->threads);
     femu_cxl_unlock(uffd_media(u));
     /*
      * Unregistering wakes waiters only for missing-mode ranges, and a fault
@@ -896,6 +1077,7 @@ void femu_uffd_destroy(FemuCxlDer *der)
         object_unparent(OBJECT(&u->alias));
     }
     g_ptr_array_free(u->holes, true);
+    g_hash_table_destroy(u->threads);
     close(u->fd);
     close(u->stop);
     g_queue_clear(&u->timers);

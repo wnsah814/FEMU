@@ -222,6 +222,13 @@ static const FemuPropDesc cxl_runtime_descs[] = {
       "Read-only event counter: der=uffd fills whose page a caching API "
       "command or a linked NVMe write dropped from the cache in flight; the "
       "thread faults again" },
+    { "uffd-holds",
+      "Read-only event counter: der=uffd holds entered, each when a thread "
+      "lost a recent page twice while faulting on no new page; its recent "
+      "pages then stay cached until it goes quiet" },
+    { "uffd-transient-fills",
+      "Read-only event counter: der=uffd fills a hold left no victim for, "
+      "mapped without a cache slot and charged as uncached accesses" },
     { "uffd-stop-faults",
       "Read-only event counter: faults the der=uffd handler took after it "
       "was asked to stop" },

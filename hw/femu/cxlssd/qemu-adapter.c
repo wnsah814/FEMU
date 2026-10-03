@@ -1599,6 +1599,11 @@ static void cxl_init(Object *obj)
     object_property_add_uint64_ptr(obj, "uffd-dropped-fills",
                                    &s->direct.uffd_dropped_fills,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-holds", &s->direct.uffd_holds,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-transient-fills",
+                                   &s->direct.uffd_transient_fills,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,
