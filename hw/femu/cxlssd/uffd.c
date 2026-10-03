@@ -108,6 +108,9 @@ struct FemuUffd {
     GQueue deferred;            /* read fills waiting for a slot */
     GHashTable *threads;        /* tid -> UffdThread */
     unsigned holding;           /* threads in a hold */
+    /* Evicted pages the handler zaps together at the end of its batch. */
+    GArray *zaps;
+    bool batching;
 };
 
 /* A run of uncached pages that MMIO serves, so each access is charged. */
@@ -230,6 +233,7 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
     g_queue_init(&u->deferred);
     u->holes = g_ptr_array_new();
     u->threads = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    u->zaps = g_array_new(false, false, sizeof(uint64_t));
     return u;
 }
 
@@ -275,6 +279,7 @@ static void uffd_zap(FemuUffd *u, uint64_t lpn)
 
     madvise(u->host + lpn * 4096, 4096, MADV_DONTNEED);
     u->der->uffd_ns_zap += now_ns() - t;
+    u->der->uffd_zap_calls++;
     qatomic_inc(&u->der->revocations);
 }
 
@@ -287,12 +292,53 @@ bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn)
     return true;
 }
 
-/* Revoke an evicted page. Under the cache lock; no-op while unmapped. */
+/*
+ * Revoke an evicted page. Under the cache lock; no-op while unmapped. The
+ * handler's own evictions wait for the end of its batch (uffd_zap_flush()).
+ */
 void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
 {
-    if (femu_uffd_installed(der)) {
-        uffd_zap(der->uffd_state, lpn);
+    FemuUffd *u = der->uffd_state;
+
+    if (!femu_uffd_installed(der)) {
+        return;
     }
+    if (u->batching) {
+        g_array_append_val(u->zaps, lpn);
+        return;
+    }
+    uffd_zap(u, lpn);
+}
+
+static gint lpn_cmp(gconstpointer a, gconstpointer b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+/* Zap the batch's victims, one call and one TLB flush per contiguous run. */
+static void uffd_zap_flush(FemuUffd *u)
+{
+    guint i = 0;
+
+    g_array_sort(u->zaps, lpn_cmp);
+    while (i < u->zaps->len) {
+        uint64_t first = g_array_index(u->zaps, uint64_t, i);
+        uint64_t n = 1;
+        int64_t t = now_ns();
+
+        while (i + n < u->zaps->len &&
+               g_array_index(u->zaps, uint64_t, i + n) == first + n) {
+            n++;
+        }
+        madvise(u->host + first * 4096, n * 4096, MADV_DONTNEED);
+        u->der->uffd_ns_zap += now_ns() - t;
+        u->der->uffd_zap_calls++;
+        qatomic_add(&u->der->revocations, n);
+        i += n;
+    }
+    g_array_set_size(u->zaps, 0);
 }
 
 static void uffd_holes_clear(FemuUffd *u)
@@ -713,6 +759,12 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
         FemuCxlOp op = { .s = uffd_media(u), .handler = true };
 
         femu_cxl_media(&op, lpn, true);
+    } else {
+        /*
+         * Evicted earlier in this batch and not zapped yet: zap it now, so
+         * the unprotect finds no page and the write faults again as a miss.
+         */
+        uffd_zap_flush(u);
     }
     ioctl(u->fd, UFFDIO_WRITEPROTECT, &w);
 }
@@ -830,6 +882,7 @@ static void *uffd_thread(void *opaque)
         }
         busy = now_ns();
         femu_cxl_lock(s);
+        u->batching = true;
         while ((n = read(u->fd, m, sizeof(m))) > 0) {
             for (size_t i = 0; i < n / sizeof(m[0]); i++) {
                 uint64_t flags = m[i].arg.pagefault.flags;
@@ -856,7 +909,11 @@ static void *uffd_thread(void *opaque)
                 }
             }
         }
+        /* Victims go before the fills that replace them are mapped. */
+        uffd_zap_flush(u);
         uffd_fire(u, false);
+        uffd_zap_flush(u);
+        u->batching = false;
         femu_cxl_unlock(s);
         u->der->uffd_ns_busy += now_ns() - busy;
         /* Stop only after taking the faults already queued. */
@@ -1078,6 +1135,7 @@ void femu_uffd_destroy(FemuCxlDer *der)
     }
     g_ptr_array_free(u->holes, true);
     g_hash_table_destroy(u->threads);
+    g_array_free(u->zaps, true);
     close(u->fd);
     close(u->stop);
     g_queue_clear(&u->timers);

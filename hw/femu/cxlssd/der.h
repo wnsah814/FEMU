@@ -68,6 +68,7 @@ struct FemuCxlDer {
     uint64_t uffd_dropped_fills;
     uint64_t uffd_holds;
     uint64_t uffd_transient_fills;
+    uint64_t uffd_zap_calls;
     /* QEMU's own, unregistered mapping of the uffd backend, and its size. */
     void *uffd_view;
     uint64_t uffd_view_size;

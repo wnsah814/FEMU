@@ -107,6 +107,7 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | `uffd-dropped-fills` | `uint64` | Read-only event counter: der=uffd fills whose page a caching API command or a linked NVMe write dropped from the cache in flight; the thread faults again |
 | `uffd-holds` | `uint64` | Read-only event counter: der=uffd holds entered, each when a thread lost a recent page twice while faulting on no new page; its recent pages then stay cached until it goes quiet |
 | `uffd-transient-fills` | `uint64` | Read-only event counter: der=uffd fills a hold left no victim for, mapped without a cache slot and charged as uncached accesses |
+| `uffd-zap-calls` | `uint64` | Read-only event counter: MADV_DONTNEED calls that zapped evicted der=uffd pages, each a TLB flush; contiguous victims of one handler batch share one |
 | `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent charging misses: media requests and cache fills with their evictions and prefetches |
 | `uffd-ns-zap` | `uint64` | Read-only: time in ns spent zapping evicted der=uffd pages |
 | `uffd-ns-continue` | `uint64` | Read-only: time in ns the der=uffd handler spent in UFFDIO_CONTINUE |

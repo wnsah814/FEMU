@@ -229,6 +229,10 @@ static const FemuPropDesc cxl_runtime_descs[] = {
     { "uffd-transient-fills",
       "Read-only event counter: der=uffd fills a hold left no victim for, "
       "mapped without a cache slot and charged as uncached accesses" },
+    { "uffd-zap-calls",
+      "Read-only event counter: MADV_DONTNEED calls that zapped evicted "
+      "der=uffd pages, each a TLB flush; contiguous victims of one handler "
+      "batch share one" },
     { "uffd-stop-faults",
       "Read-only event counter: faults the der=uffd handler took after it "
       "was asked to stop" },

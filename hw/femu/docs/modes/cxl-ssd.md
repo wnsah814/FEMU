@@ -329,7 +329,7 @@ without an exit.
 | `off` (default) | Every access traps to QEMU | Nothing | Slow hits; every hit is counted and timed |
 | `memslot` | Cached pages become KVM memory slot aliases | KVM. Refused under TCG | At most 1024 mapped pages (4 MiB) across all devices |
 | `cylon` | Cached pages are written into KVM's page tables by a Cylon host kernel | The fixed Cylon host kernel, a hugetlb backend, `cylon-kernel-ack=on` | Only on that kernel; falls back to MMIO elsewhere |
-| `uffd` | The window is one alias of the backend; pages outside the cache are zapped and a userfaultfd handler fills them | Linux 6.4, a shared preallocated memfd backend, 4 or more ways and not `lifo`, `/dev/userfaultfd` under KVM | One handler thread; every eviction flushes the VM's TLBs |
+| `uffd` | The window is one alias of the backend; pages outside the cache are zapped and a userfaultfd handler fills them | Linux 6.4, a shared preallocated memfd backend, 4 or more ways and not `lifo`, `/dev/userfaultfd` under KVM | One handler thread; evictions flush the VM's TLBs, once per batch of faults and contiguous run |
 
 As a reference point, one host (Xeon Gold 6548Y+, 256 MiB device, 1024-page
 cache) measured a median cached load of about 3.0 us with `off` and 105 ns

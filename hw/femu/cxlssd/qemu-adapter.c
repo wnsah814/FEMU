@@ -1604,6 +1604,9 @@ static void cxl_init(Object *obj)
     object_property_add_uint64_ptr(obj, "uffd-transient-fills",
                                    &s->direct.uffd_transient_fills,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "uffd-zap-calls",
+                                   &s->direct.uffd_zap_calls,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-ftl", &s->direct.uffd_ns_ftl,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "uffd-ns-zap", &s->direct.uffd_ns_zap,

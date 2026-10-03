@@ -193,9 +193,17 @@ write protection. A page outside the cache is zapped from the backend's page
 tables (`MADV_DONTNEED`), so touching it raises a minor fault; a handler thread
 charges the miss to the FTL and resolves the fault with `UFFDIO_CONTINUE` once
 the media time has passed. A page read first is mapped write-protected, so its
-first write marks it dirty; a write miss is mapped writable and dirty at once. Hits never leave the hardware. A resolved fill stays
-pinned until the thread that faulted on it faults on another page (or 1 ms), and
-a fill whose victim is pinned or still being filled waits for a slot.
+first write marks it dirty; a write miss is mapped writable and dirty at once.
+Each zap flushes the VM's TLBs, so the handler zaps the victims of a batch of
+faults together, after it has read the batch and before it
+maps the fills, one `MADV_DONTNEED` per contiguous run (`uffd-zap-calls`); with
+prefetch the victims of one fill are often contiguous. Until then a victim stays
+mapped: a write-protect fault on it zaps the batch first and faults again as a
+miss, but a dirty victim, already writable, takes writes that are not charged
+again until the zap, which comes before the handler releases the cache lock.
+Hits never leave the hardware. A resolved fill stays pinned until the thread
+that faulted on it faults on another page (or 1 ms), and a fill whose victim is
+pinned or still being filled waits for a slot.
 
 One instruction can need more pages mapped at once than a set has ways: code,
 operands and page tables on the device, each perhaps across a page boundary.
