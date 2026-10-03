@@ -186,7 +186,7 @@ not update CLOCK/S3-FIFO reference metadata or MMIO hit counters.
 
 ### userfaultfd mapping
 
-`der=uffd` is a prototype. The first decoded access maps the whole window as one
+With `der=uffd` the first decoded access maps the whole window as one
 alias of the backend, which must be a shared, preallocated
 `memory-backend-memfd`, and registers it with userfaultfd for minor faults and
 write protection. A page outside the cache is zapped from the backend's page
@@ -197,13 +197,20 @@ marks the page dirty. Hits never leave the hardware. A resolved fill stays
 pinned until the thread that faulted on it faults on another page (or 1 ms), and
 a fill whose victim is pinned or still being filled waits for a slot.
 
-The handler owns the cache while the window is mapped; MMIO accesses that still
-arrive only copy. So that no MMIO miss is still filling the cache when the
-handler takes it over, only an access with no other in progress maps the window
-(with `concurrent-misses=on`, or under `auto` just after the window is
-unmapped). Invalidation, flush, a way change and anything else that
-clears direct mappings stop the handler and hand the cache back to the MMIO
-path; the next access maps the window again. The mode needs Linux 6.4
+The cache, its policy, prefetch and the counters are the MMIO path's: the
+handler and MMIO accesses share them under one lock, so the same accesses give
+the same misses, fills, evictions and media work as under `der=off` (qtest
+`cxl-uffd-same`). Hits are not seen, as in the other direct modes; a page cached
+before the window was mapped faults once and counts as a hit. A page whose set
+has every way pinned, or that NAND has no room to fill, is served without a
+slot: charged as one uncached access and zapped once its thread moves on (at
+most 1 ms later); unlike under `der=off`, accesses while it stays mapped are not
+charged. Only an
+access with no other in progress maps the window (with `concurrent-misses=on`,
+or under `auto` just after the window is unmapped), and an MMIO access still in
+flight after that only copies. Invalidation, flush, a way change and anything
+else that clears direct mappings stop the handler; the next access maps the
+window again. The mode needs Linux 6.4
 (`UFFDIO_CONTINUE_MODE_WP`), access to `/dev/userfaultfd` or `CAP_SYS_PTRACE`
 under KVM, and a window that decodes linearly onto the device from DPA zero. The
 guest should pass HLT through (`-overcommit cpu-pm=on`) and turn off PV async

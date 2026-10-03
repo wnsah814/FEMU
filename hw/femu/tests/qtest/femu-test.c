@@ -16245,6 +16245,79 @@ static void femu_test_cxl_uffd_prefetch(void *obj, void *data,
     qtest_quit(qts);
 }
 
+static const char *const femu_cxl_same_stats[] = {
+    "read-misses", "write-misses", "cache-inserts", "cache-evictions",
+    "prefetch-inserts", "media-reads", "media-writes",
+};
+
+/*
+ * One access sequence on a 64-page, 4-way FIFO cache with prefetch: reads
+ * over 400 pages, writes to 100 of them, reads over 500, then a flush. False
+ * if der=uffd could not map the window.
+ */
+static bool femu_cxl_same_run(const char *der, uint64_t *stats)
+{
+    QTestState *qts = qtest_initf(
+        "-machine q35,cxl=on -m 128M "
+        "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 "
+        "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
+        "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on "
+        "-device femu-cxl-ssd,id=ssd,bus=rp0,volatile-memdev=mem,"
+        "cache-pages=64,cache-ways=4,der=%s,read-ns=1000,program-ns=1000",
+        der);
+    bool mapped;
+    uint64_t i;
+
+    femu_cxl_decode(qts);
+    femu_cxl_number(qts, "prefetch-degree", 2, true);
+    qtest_readq(qts, FEMU_CXL_WINDOW);
+    mapped = femu_cxl_active(qts);
+    for (i = 0; i < 300; i++) {
+        qtest_readq(qts, FEMU_CXL_WINDOW + i * 7 % 400 * 4096);
+    }
+    for (i = 0; i < 100; i++) {
+        qtest_writeq(qts, FEMU_CXL_WINDOW + i * 13 % 400 * 4096, i);
+    }
+    for (i = 0; i < 300; i++) {
+        qtest_readq(qts, FEMU_CXL_WINDOW + i * 11 % 500 * 4096);
+    }
+    femu_cxl_set(qts, "flush-cache", true);
+    for (i = 0; i < ARRAY_SIZE(femu_cxl_same_stats); i++) {
+        stats[i] = femu_cxl_stat(qts, femu_cxl_same_stats[i]);
+    }
+    femu_cxl_set(qts, "realized", false);
+    qtest_quit(qts);
+    return mapped;
+}
+
+/*
+ * The cache, its policy, prefetch and the counters are shared by every DER
+ * mode: the same accesses give the same misses, fills, evictions and media
+ * work under der=off, where every access is MMIO, and under der=uffd, where
+ * only faults reach the device. Hits differ: uffd sees none.
+ */
+static void femu_test_cxl_uffd_same(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    uint64_t off[ARRAY_SIZE(femu_cxl_same_stats)];
+    uint64_t uffd[ARRAY_SIZE(femu_cxl_same_stats)];
+    unsigned i;
+
+    femu_cxl_same_run("off", off);
+    if (!femu_cxl_same_run("uffd", uffd)) {
+        g_test_skip("userfaultfd minor faults on shmem are unavailable");
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(femu_cxl_same_stats); i++) {
+        g_test_message("%s: off %" PRIu64 ", uffd %" PRIu64,
+                       femu_cxl_same_stats[i], off[i], uffd[i]);
+        g_assert_cmpuint(uffd[i], ==, off[i]);
+    }
+    g_assert_cmpuint(off[0], >, 200);
+    g_assert_cmpuint(off[6], >, 50);
+}
+
 /*
  * der=uffd with a direct ratio: a selected page is mapped on first touch,
  * outside the cache and with no media read, and writes to it are not
@@ -20702,6 +20775,7 @@ static void femu_register_nodes(void)
     qos_add_test("cxl-uffd-prefetch", "femu", femu_test_cxl_uffd_prefetch,
                  NULL);
     qos_add_test("cxl-uffd-ratio", "femu", femu_test_cxl_uffd_ratio, NULL);
+    qos_add_test("cxl-uffd-same", "femu", femu_test_cxl_uffd_same, NULL);
     qos_add_test("cxl-wait-uffd", "femu", femu_test_cxl_wait,
                  &(QOSGraphTestOptions) { .arg = (void *)7 });
     qos_add_test("cxl-nvme-gate-unplug", "femu", femu_test_cxl_nvme_gate,

@@ -12,6 +12,9 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                             const char **reason);
 bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner);
 bool femu_uffd_installed(FemuCxlDer *der);
+bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn);
+void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn);
+bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn);
 void femu_uffd_uninstall(FemuCxlDer *der);
 void femu_uffd_destroy(FemuCxlDer *der);
 #endif

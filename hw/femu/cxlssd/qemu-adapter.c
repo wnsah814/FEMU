@@ -2106,13 +2106,18 @@ static bool cylon_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
 /*
  * uffd maps the whole window at once, from a demand access (@e set): a
  * prefetch must not start the handler while its access still inserts.
- * The alias maps window offset X to backend offset X.
+ * The alias maps window offset X to backend offset X. Once it is mapped,
+ * mapping a page resolves its fault, so a prefetched page does not fault.
  */
 static bool uffd_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
                      FemuCxlEntry *e)
 {
-    CXLFixedWindow *fw = e && der->uffd_state ? der_window(der, hpa) : NULL;
+    CXLFixedWindow *fw;
 
+    if (femu_uffd_installed(der)) {
+        return femu_uffd_map_page(der, dpa / 4096);
+    }
+    fw = e && der->uffd_state ? der_window(der, hpa) : NULL;
     if (fw && !der_linear(der, fw)) {
         der->fallbacks++;
         return false;
@@ -2325,13 +2330,10 @@ static void memslot_unmap(FemuCxlDer *der, uint64_t lpn)
     g_free_rcu(map, rcu);
 }
 
-/*
- * Only the MMIO path evicts pages here, and it owns the cache only while
- * uffd is not mapped, when uffd maps nothing. The callers that drop single
- * pages from elsewhere (CCA, a linked NVMe controller) are refused.
- */
+/* Zap the page; its data stays in the memfd's page cache. */
 static void uffd_unmap(FemuCxlDer *der, uint64_t lpn)
 {
+    femu_uffd_zap(der, lpn);
 }
 
 void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn)
@@ -2345,9 +2347,15 @@ static bool memslot_sample(FemuCxlDer *der, uint64_t lpn)
     return false;
 }
 
+/* A direct ratio page is mapped writable and unwatched, as with memslot. */
 static bool uffd_sample(FemuCxlDer *der, uint64_t lpn)
 {
-    return false;
+    return femu_uffd_installed(der);
+}
+
+bool femu_cxl_der_busy(FemuCxlDer *der, uint64_t lpn)
+{
+    return der->ops->busy && der->ops->busy(der, lpn);
 }
 
 /*
@@ -2444,6 +2452,7 @@ static const FemuCxlDerOps der_uffd_ops = {
     .map = uffd_map,
     .unmap = uffd_unmap,
     .sample = uffd_sample,
+    .busy = femu_uffd_busy,
     .flush = uffd_flush,
 };
 

@@ -210,8 +210,8 @@ static const FemuPropDesc cxl_runtime_descs[] = {
     { "der-replacements",
       "Read-only: memslot aliases displaced by a hotter page" },
     { "uffd-faults",
-      "Read-only event counter: missing-page faults the der=uffd handler "
-      "took" },
+      "Read-only event counter: minor faults the der=uffd handler took on "
+      "pages it had not mapped" },
     { "uffd-wp-faults",
       "Read-only event counter: first-write faults the der=uffd handler "
       "took, each marking a resident page dirty" },
@@ -222,9 +222,10 @@ static const FemuPropDesc cxl_runtime_descs[] = {
       "Read-only event counter: faults the der=uffd handler took after it "
       "was asked to stop" },
     { "uffd-ns-ftl",
-      "Read-only: time in ns the der=uffd handler spent in FTL calls" },
+      "Read-only: time in ns the der=uffd handler spent charging misses: "
+      "media requests and cache fills with their evictions and prefetches" },
     { "uffd-ns-zap",
-      "Read-only: time in ns the der=uffd handler spent zapping victims" },
+      "Read-only: time in ns spent zapping evicted der=uffd pages" },
     { "uffd-ns-continue",
       "Read-only: time in ns the der=uffd handler spent in "
       "UFFDIO_CONTINUE" },

@@ -27,6 +27,8 @@ typedef struct FemuCxlDerOps {
     void (*unmap)(FemuCxlDer *der, uint64_t lpn);
     /* Whether a mapped page was written since the last sample. */
     bool (*sample)(FemuCxlDer *der, uint64_t lpn);
+    /* Whether the page is still being mapped, so cannot be evicted. */
+    bool (*busy)(FemuCxlDer *der, uint64_t lpn);
     /* Revoke every mapping. */
     void (*flush)(FemuCxlDer *der);
     /* Bracket a batch of unmaps; optional. */
@@ -55,7 +57,7 @@ struct FemuCxlDer {
     uint64_t uffd_wp_faults;
     uint64_t uffd_pending_victims;
     uint64_t uffd_stop_faults;  /* faults taken after a stop request */
-    /* uffd handler time, ns: FTL calls, victim zaps, continues, all work */
+    /* uffd time, ns: charging misses, zaps, continues, all handler work */
     uint64_t uffd_ns_ftl;
     uint64_t uffd_ns_zap;
     uint64_t uffd_ns_continue;
@@ -126,6 +128,7 @@ bool femu_cxl_der_map(FemuCxlDer *der, uint64_t hpa, uint64_t dpa,
 void femu_cxl_der_remove(FemuCxlDer *der, uint64_t lpn);
 bool femu_cxl_der_sample(FemuCxlDer *der, uint64_t lpn);
 void femu_cxl_der_clear(FemuCxlDer *der);
+bool femu_cxl_der_busy(FemuCxlDer *der, uint64_t lpn);
 void femu_cxl_der_begin(FemuCxlDer *der);
 void femu_cxl_der_commit(FemuCxlDer *der);
 void femu_cxl_der_disable(FemuCxlDer *der);

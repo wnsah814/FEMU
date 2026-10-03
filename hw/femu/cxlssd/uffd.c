@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * der=uffd, a prototype: the whole window is one RAM alias of a shared memfd
+ * der=uffd: the whole window is one RAM alias of a shared memfd
  * backend, and the cache decides which pages the guest can reach by keeping
  * them in, or zapping them out of, the backend's page tables. A zapped page
  * raises a userfaultfd minor fault when anything (the guest through KVM, or
  * QEMU) touches it; the handler thread charges the miss to the FTL and resolves
  * the fault with UFFDIO_CONTINUE once the media time has passed. Pages are
  * mapped write-protected, so the first write of each residency raises a WP
- * fault that marks the page dirty.
+ * fault that marks the page dirty. The cache, its policy, prefetch and the
+ * counters are the MMIO path's (femu_cxl_lookup(), femu_cxl_fill()), shared
+ * under the cache lock; the handler never takes the BQL.
  */
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
@@ -40,7 +42,13 @@ typedef struct UffdTimer {
     uint64_t lpn;
     int64_t due;
     uint32_t tid;               /* the thread whose fault started the fill */
+    bool write;
     bool resolved;
+    /*
+     * Served without a cache slot, because every way of its set is pinned or
+     * NAND is full: charged as an uncached access and zapped when unpinned.
+     */
+    bool transient;
 } UffdTimer;
 
 struct FemuUffd {
@@ -52,6 +60,7 @@ struct FemuUffd {
     MemoryRegion *ram;          /* the backend's region */
     MemoryRegion alias;
     MemoryRegion *container;    /* where the alias was added, once */
+    uint64_t base;              /* the window's HPA */
     bool installed;
     QemuThread thread;
     GHashTable *pending;        /* lpn -> UffdTimer, pages not yet evictable */
@@ -59,8 +68,6 @@ struct FemuUffd {
     GQueue pins;                /* resolved fills still pinned, by due time */
     GHashTable *pinned;         /* tid -> its resolved, pinned fill */
     GQueue deferred;            /* read fills waiting for a slot */
-    int64_t evict_ns;           /* write-back time of the current miss */
-    int64_t stime;
 };
 
 static int64_t now_ns(void)
@@ -179,32 +186,50 @@ static void uffd_continue(FemuUffd *u, uint64_t lpn)
     uffd_continue_mode(u, lpn, true);
 }
 
-static bool uffd_evict(void *opaque, FemuCxlEntry *e)
+/* Wake the page's waiters without mapping it, so they fault again. */
+static void uffd_wake(FemuUffd *u, uint64_t lpn)
 {
-    FemuUffd *u = opaque;
+    struct uffdio_range r = { (uintptr_t)u->host + lpn * 4096, 4096 };
 
-    if (g_hash_table_contains(u->pending, &e->lpn)) {
-        u->der->uffd_pending_victims++;
-        return false;
-    }
+    ioctl(u->fd, UFFDIO_WAKE, &r);
+}
+
+static void uffd_zap(FemuUffd *u, uint64_t lpn)
+{
     int64_t t = now_ns();
 
-    /*
-     * Zap the guest's view; the data stays in the memfd's page cache. A
-     * direct ratio keeps its pages mapped, as the other modes do.
-     */
-    if (!femu_cxl_ratio_selected(u->der->ratio, e->lpn)) {
-        madvise(u->host + e->lpn * 4096, 4096, MADV_DONTNEED);
-        u->der->uffd_ns_zap += now_ns() - t;
-        qatomic_inc(&u->der->revocations);
-    }
-    if (e->dirty && !uffd_media(u)->free_writeback) {
-        t = now_ns();
-        u->evict_ns += femu_cxl_media_direct(uffd_media(u), e->lpn, true,
-                                             u->stime + u->evict_ns);
-        u->der->uffd_ns_ftl += now_ns() - t;
-    }
+    madvise(u->host + lpn * 4096, 4096, MADV_DONTNEED);
+    u->der->uffd_ns_zap += now_ns() - t;
+    qatomic_inc(&u->der->revocations);
+}
+
+/* The cache lock is held, by the handler or by an access mapping a page. */
+bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn)
+{
+    /* A direct ratio page goes unwatched, as with memslot. */
+    uffd_continue_mode(der->uffd_state, lpn,
+                       !femu_cxl_ratio_selected(der->ratio, lpn));
     return true;
+}
+
+/* Revoke an evicted page. Under the cache lock; no-op while unmapped. */
+void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
+{
+    if (femu_uffd_installed(der)) {
+        uffd_zap(der->uffd_state, lpn);
+    }
+}
+
+/* A page still being filled, or pinned for its thread, is no victim. */
+bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn)
+{
+    FemuUffd *u = der->uffd_state;
+
+    if (u && u->installed && g_hash_table_contains(u->pending, &lpn)) {
+        der->uffd_pending_victims++;
+        return true;
+    }
+    return false;
 }
 
 static gint timer_cmp(gconstpointer a, gconstpointer b, gpointer unused)
@@ -222,6 +247,9 @@ static void uffd_unpin(FemuUffd *u, UffdTimer *t)
         g_hash_table_remove(u->pinned, tid);
     }
     g_queue_remove(&u->pins, t);
+    if (t->transient) {
+        uffd_zap(u, t->lpn);
+    }
     g_hash_table_remove(u->pending, &t->lpn);
 }
 
@@ -239,51 +267,31 @@ static bool uffd_release(FemuUffd *u, int64_t now, bool all)
 }
 
 /*
- * As on the MMIO path: after a demand fill takes its slot, insert the next
- * prefetch-degree pages from prefetch-stride on, with no media read, and map
- * them at once. Their victims' write-backs delay the demand fill. No thread
- * waits on them, so they are neither pending nor pinned.
- */
-static void uffd_prefetch(FemuUffd *u, uint64_t lpn)
-{
-    FemuCxlMedia *s = uffd_media(u);
-    FemuCxlCache *cache = u->der->cache;
-    uint64_t stride = qatomic_read(&s->prefetch_stride);
-    uint64_t degree = MIN(qatomic_read(&s->prefetch_degree), s->cache_pages);
-    uint64_t end = MIN(u->size / 4096, lpn + stride + degree);
-    uint64_t next;
-
-    for (next = lpn + stride; next < end; next++) {
-        if (g_hash_table_contains(cache->entries, &next) ||
-            g_hash_table_contains(u->pending, &next) ||
-            femu_cxl_ratio_selected(u->der->ratio, next) ||
-            femu_cxl_cache_all_pinned(cache, next)) {
-            continue;
-        }
-        if (!femu_cxl_cache_insert(cache, next, uffd_evict, u)) {
-            break;
-        }
-        qatomic_inc(&s->prefetch_inserts);
-        uffd_continue(u, next);
-    }
-}
-
-/*
  * Give a fill whose read is charged its cache slot, and schedule it after the
- * read and the victim's write-back. A victim still being filled, or pinned,
- * cannot be evicted, and a page mapped without a slot would never be zapped
- * or charged again, so the fill waits until a slot is freed.
+ * read and the write-backs of its victims and prefetches. A victim still being
+ * filled, or pinned, cannot be evicted, and a page mapped without a slot would
+ * never be zapped or charged again, so the fill waits until a slot is freed.
  */
 static void uffd_place(FemuUffd *u, UffdTimer *t)
 {
-    u->stime = MAX(t->due, now_ns());
-    u->evict_ns = 0;
-    if (!femu_cxl_cache_insert(u->der->cache, t->lpn, uffd_evict, u)) {
-        g_queue_push_tail(&u->deferred, t);
-        return;
+    FemuCxlOp op = {
+        .s = uffd_media(u),
+        .start = MAX(t->due, now_ns()),
+        .handler = true,
+    };
+    int64_t start = now_ns();
+
+    if (!t->transient && !femu_cxl_fill(&op, t->lpn, t->write, u->base)) {
+        if (op.held) {
+            g_queue_push_tail(&u->deferred, t);
+            u->der->uffd_ns_ftl += now_ns() - start;
+            return;
+        }
+        t->transient = true;
     }
-    uffd_prefetch(u, t->lpn);
-    t->due = u->stime + u->evict_ns;
+    u->der->uffd_ns_ftl += now_ns() - start;
+    uffd_media(u)->cache_entries = g_hash_table_size(u->der->cache->entries);
+    t->due = op.start + op.ns;
     g_queue_insert_sorted(&u->timers, t, timer_cmp, NULL);
 }
 
@@ -297,11 +305,13 @@ static void uffd_retry(FemuUffd *u)
     }
 }
 
-static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid)
+static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid, bool write)
 {
-    FemuCxlCache *cache = u->der->cache;
+    FemuCxlMedia *s = uffd_media(u);
+    FemuCxlOp op = { .s = s, .start = now_ns(), .handler = true };
+    FemuCxlEntry *e;
     UffdTimer *t;
-    int64_t stime;
+    bool to_media;
 
     u->der->uffd_faults++;
     t = g_hash_table_lookup(u->pending, &lpn);
@@ -312,33 +322,44 @@ static void uffd_miss(FemuUffd *u, uint64_t lpn, uint32_t tid)
         }
         return;
     }
-    if (g_hash_table_lookup(cache->entries, &lpn)) {
-        uffd_continue(u, lpn);  /* resident: a fault that raced its fill */
+    /*
+     * A direct ratio page is mapped outside the cache at no media cost. A
+     * ratio change uninstalls the handler, so the ratio is fixed here.
+     */
+    if (femu_cxl_ratio_selected(u->der->ratio, lpn)) {
+        femu_uffd_map_page(u->der, lpn);
         return;
     }
     /*
-     * A direct ratio page is mapped outside the cache at no media cost, and
-     * without write protection: as with memslot, writes through it are not
-     * seen. A ratio change uninstalls the handler, so the ratio is fixed here.
+     * Hits are not seen: a resident page faults only when the window was
+     * mapped after it was cached, or when the fault raced its fill.
      */
-    if (femu_cxl_ratio_selected(u->der->ratio, lpn)) {
-        uffd_continue_mode(u, lpn, false);
+    e = femu_cxl_lookup(s, lpn, write, &to_media);
+    if (e) {
+        uffd_continue(u, lpn);
         return;
     }
-    cache->misses++;
-    stime = now_ns();
     t = g_new0(UffdTimer, 1);
     t->lpn = lpn;
     t->tid = tid;
-    t->due = stime + femu_cxl_media_direct(uffd_media(u), lpn, false, stime);
-    u->der->uffd_ns_ftl += now_ns() - stime;
+    t->write = write;
+    t->transient = to_media;
+    /* A failed read only loses timing; the data is in host memory. */
+    femu_cxl_media(&op, lpn, write && to_media);
+    u->der->uffd_ns_ftl += now_ns() - op.start;
+    t->due = op.start + op.ns;
     g_hash_table_insert(u->pending, &t->lpn, t);
-    uffd_place(u, t);
+    if (to_media) {
+        g_queue_insert_sorted(&u->timers, t, timer_cmp, NULL);
+    } else {
+        uffd_place(u, t);
+    }
 }
 
 static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
 {
     FemuCxlEntry *e = g_hash_table_lookup(u->der->cache->entries, &lpn);
+    UffdTimer *t = g_hash_table_lookup(u->pending, &lpn);
     struct uffdio_writeprotect w = {
         .range = { (uintptr_t)u->host + lpn * 4096, 4096 },
         .mode = 0,
@@ -347,15 +368,22 @@ static void uffd_wp_fault(FemuUffd *u, uint64_t lpn)
     u->der->uffd_wp_faults++;
     if (e) {
         e->dirty = true;
+    } else if (t && t->transient) {
+        /* An uncached write goes to the media. */
+        FemuCxlOp op = { .s = uffd_media(u), .handler = true };
+
+        femu_cxl_media(&op, lpn, true);
     }
     ioctl(u->fd, UFFDIO_WRITEPROTECT, &w);
 }
 
 /*
  * Resolve fills whose media time has passed, and pin their pages; with @all,
- * resolve every pending fill and unpin everything. A deferred fill waits only
- * for an in-cache fill, which is on the timer or pinned queue, so with @all
- * all three drain.
+ * resolve every pending fill and unpin everything. A deferred fill waits for
+ * a slot, usually one that an in-cache fill on the timer or pinned queue
+ * holds; with @all those drain, and femu_uffd_uninstall() drops the fills
+ * that wait for pages an MMIO access holds. A page dropped from the cache
+ * while its fill was in flight is not mapped: its waiters fault again.
  */
 static void uffd_fire(FemuUffd *u, bool all)
 {
@@ -367,6 +395,12 @@ static void uffd_fire(FemuUffd *u, bool all)
         freed = false;
         while ((t = g_queue_peek_head(&u->timers)) && (all || t->due <= now)) {
             g_queue_pop_head(&u->timers);
+            if (!t->transient &&
+                !g_hash_table_contains(u->der->cache->entries, &t->lpn)) {
+                uffd_wake(u, t->lpn);
+                g_hash_table_remove(u->pending, &t->lpn);
+                continue;
+            }
             uffd_continue(u, t->lpn);
             t->resolved = true;
             t->due = now + UFFD_PIN_NS;
@@ -378,47 +412,68 @@ static void uffd_fire(FemuUffd *u, bool all)
             }
             g_hash_table_insert(u->pinned, GUINT_TO_POINTER(t->tid), t);
         }
-        if (uffd_release(u, now, all) || freed) {
+        /* A fill may also wait for a page an MMIO access held. */
+        if (uffd_release(u, now, all) || freed || u->deferred.length) {
             uffd_retry(u);
         }
     } while (all && !g_queue_is_empty(&u->timers));
 }
 
+/*
+ * When the next fill or pin is due: a pin's end frees a slot for a deferred
+ * fill, and zaps a page served without a slot.
+ */
+static UffdTimer *uffd_next(FemuUffd *u)
+{
+    UffdTimer *t = g_queue_peek_head(&u->timers);
+    UffdTimer *g = g_queue_peek_head(&u->pins);
+
+    return g && (!t || g->due < t->due) ? g : t;
+}
+
 static void *uffd_thread(void *opaque)
 {
     FemuUffd *u = opaque;
+    FemuCxlMedia *s = uffd_media(u);
     struct uffd_msg m[32];
 
     for (;;) {
         struct pollfd p[2] = {
             { u->fd, POLLIN, 0 }, { u->stop, POLLIN, 0 },
         };
-        UffdTimer *t = g_queue_peek_head(&u->timers);
-        /* A pin's time limit needs a wake-up only when a fill waits on it. */
-        UffdTimer *g = u->deferred.length ? g_queue_peek_head(&u->pins)
-                                          : NULL;
         struct timespec ts, *tsp = NULL;
+        UffdTimer *t;
         int64_t busy;
         uint64_t faults = 0;
         ssize_t n;
 
-        if (g && (!t || g->due < t->due)) {
-            t = g;
-        }
-        if (t) {
-            int64_t wait = MAX(0, t->due - now_ns());
+        femu_cxl_lock(s);
+        t = uffd_next(u);
+        /*
+         * A fill may wait for a victim that an MMIO access holds, which no
+         * timer here ends: look again at least every pin's time.
+         */
+        if (t || u->deferred.length) {
+            int64_t wait = t ? MAX(0, t->due - now_ns()) : UFFD_PIN_NS;
+
+            if (u->deferred.length) {
+                wait = MIN(wait, UFFD_PIN_NS);
+            }
 
             ts.tv_sec = wait / NANOSECONDS_PER_SECOND;
             ts.tv_nsec = wait % NANOSECONDS_PER_SECOND;
             tsp = &ts;
         }
+        femu_cxl_unlock(s);
         /* On an error (EINTR) no revents are set; poll again. */
         if (ppoll(p, 2, tsp, NULL) < 0) {
             continue;
         }
         busy = now_ns();
+        femu_cxl_lock(s);
         while ((n = read(u->fd, m, sizeof(m))) > 0) {
             for (size_t i = 0; i < n / sizeof(m[0]); i++) {
+                uint64_t flags = m[i].arg.pagefault.flags;
                 uint32_t tid = m[i].arg.pagefault.feat.ptid;
                 UffdTimer *pin;
                 uint64_t lpn;
@@ -434,14 +489,15 @@ static void *uffd_thread(void *opaque)
                     uffd_unpin(u, pin);
                     uffd_retry(u);
                 }
-                if (m[i].arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
+                if (flags & UFFD_PAGEFAULT_FLAG_WP) {
                     uffd_wp_fault(u, lpn);
                 } else {
-                    uffd_miss(u, lpn, tid);
+                    uffd_miss(u, lpn, tid, flags & UFFD_PAGEFAULT_FLAG_WRITE);
                 }
             }
         }
         uffd_fire(u, false);
+        femu_cxl_unlock(s);
         u->der->uffd_ns_busy += now_ns() - busy;
         /* Stop only after taking the faults already queued. */
         if (p[1].revents) {
@@ -480,10 +536,9 @@ static bool uffd_cache_fits(FemuCxlCache *c)
 }
 
 /*
- * The first decoded access maps the whole window, and the handler owns the
- * cache while it is mapped. Entries already resident stay resident: their
- * pages fault once and are continued at no media cost. The caller checked
- * that the window decodes linearly onto the backend.
+ * The first decoded access maps the whole window. Entries already resident
+ * stay resident: their pages fault once and are continued at no media cost.
+ * The caller checked that the window decodes linearly onto the backend.
  */
 bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
 {
@@ -499,9 +554,10 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
         return true;
     }
     /*
-     * The handler takes the cache over, so the access that maps the window
-     * must be the only one using it: with overlapping misses another may still
-     * wait for the media and insert behind the handler. A later access maps it.
+     * The access that maps the window must be the only one in the gate: with
+     * overlapping misses another may still hold pages the handler would then
+     * fault on, and an access in flight after this one only copies (see
+     * femu_cxl_access()). A later access maps it.
      */
     if (uffd_media(u)->accesses > 1) {
         return false;
@@ -536,6 +592,7 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
                                  u->size);
         memory_region_add_subregion_overlap(&fw->mr, 0, &u->alias, 1);
         u->container = &fw->mr;
+        u->base = fw->base;
     } else {
         memory_region_set_enabled(&u->alias, true);
     }
@@ -547,14 +604,16 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
 
 /*
  * Invalidation and teardown: stop the handler, resolve the faults it had in
- * flight, stop catching faults and hand the cache back to the MMIO path.
+ * flight, stop catching faults and leave accesses to the MMIO path.
  * Invalidation must not wait, but the join is short: the handler never takes
- * the BQL and holds the FTL lock for one request at a time.
+ * the BQL and holds the cache lock for one batch of faults at a time. The
+ * caller must not hold the cache lock.
  */
 void femu_uffd_uninstall(FemuCxlDer *der)
 {
     FemuUffd *u = der->uffd_state;
     struct uffdio_range r;
+    UffdTimer *t;
     uint64_t v = 1;
 
     if (!u || !u->installed) {
@@ -567,7 +626,13 @@ void femu_uffd_uninstall(FemuCxlDer *der)
     if (read(u->stop, &v, sizeof(v)) != sizeof(v)) {
         error_report("femu-cxl-uffd: cannot rearm the handler");
     }
+    femu_cxl_lock(uffd_media(u));
     uffd_fire(u, true);
+    /* Their threads are woken below and fault again on the next install. */
+    while ((t = g_queue_pop_head(&u->deferred))) {
+        g_hash_table_remove(u->pending, &t->lpn);
+    }
+    femu_cxl_unlock(uffd_media(u));
     /*
      * Unregistering wakes waiters only for missing-mode ranges, and a fault
      * that arrived after the handler's last read is still waiting. Wake the
@@ -619,6 +684,20 @@ bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner)
 }
 
 bool femu_uffd_installed(FemuCxlDer *der)
+{
+    return false;
+}
+
+bool femu_uffd_map_page(FemuCxlDer *der, uint64_t lpn)
+{
+    return false;
+}
+
+void femu_uffd_zap(FemuCxlDer *der, uint64_t lpn)
+{
+}
+
+bool femu_uffd_busy(FemuCxlDer *der, uint64_t lpn)
 {
     return false;
 }

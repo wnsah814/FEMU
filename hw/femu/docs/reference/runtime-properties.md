@@ -100,12 +100,12 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 
 | Property | Type | Description |
 | --- | --- | --- |
-| `uffd-faults` | `uint64` | Read-only event counter: missing-page faults the der=uffd handler took |
+| `uffd-faults` | `uint64` | Read-only event counter: minor faults the der=uffd handler took on pages it had not mapped |
 | `uffd-wp-faults` | `uint64` | Read-only event counter: first-write faults the der=uffd handler took, each marking a resident page dirty |
 | `uffd-pending-victims` | `uint64` | Read-only event counter: der=uffd evictions refused because the victim was being filled or pinned for the thread that faulted |
 | `uffd-stop-faults` | `uint64` | Read-only event counter: faults the der=uffd handler took after it was asked to stop |
-| `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent in FTL calls |
-| `uffd-ns-zap` | `uint64` | Read-only: time in ns the der=uffd handler spent zapping victims |
+| `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent charging misses: media requests and cache fills with their evictions and prefetches |
+| `uffd-ns-zap` | `uint64` | Read-only: time in ns spent zapping evicted der=uffd pages |
 | `uffd-ns-continue` | `uint64` | Read-only: time in ns the der=uffd handler spent in UFFDIO_CONTINUE |
 | `uffd-ns-busy` | `uint64` | Read-only: time in ns the der=uffd handler spent awake, all work included |
 

@@ -213,39 +213,6 @@ static bool cxl_op_holds(FemuCxlOp *op, uint64_t lpn)
     return false;
 }
 
-/*
- * der=uffd: the fault handler's media access, outside the BQL and the gate,
- * starting at @stime; returns its latency. Like a linked controller's request,
- * it runs on the FTL under @lock. While uffd is mapped, MMIO accesses only
- * copy, so the handler is the only writer of the media counters; QOM reads
- * them under the BQL.
- */
-int64_t femu_cxl_media_direct(FemuCxlMedia *s, uint64_t lpn, bool write,
-                              int64_t stime)
-{
-    NvmeRequest req = {
-        .cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ,
-        .ns = &s->ns,
-        .slba = lpn * 8,
-        .nlb = 8,
-        .stime = stime,
-    };
-    int64_t latency;
-
-    if (!s->ftl) {
-        return 0;
-    }
-    qemu_mutex_lock(&s->lock);
-    latency = cxl_ftl_run(s, &req);
-    qatomic_set(&s->media_writes, ssd_nand_write_pages(s->ns.ssd));
-    qemu_mutex_unlock(&s->lock);
-    if (req.cmd.opcode == NVME_CMD_READ) {
-        qatomic_inc(&s->media_reads);
-    }
-    qatomic_add(&s->media_ns, latency);
-    return latency;
-}
-
 /* Called under @cache_lock, so the write-back runs inline. */
 bool femu_cxl_evict(void *opaque, FemuCxlEntry *e)
 {
@@ -253,9 +220,13 @@ bool femu_cxl_evict(void *opaque, FemuCxlEntry *e)
     FemuCxlMedia *s = op->s;
 
     assert(cache_locked);
-    /* Another access holds the page; keep it and let the caller go uncached. */
-    if (!cxl_op_holds(op, e->lpn) &&
-        g_hash_table_contains(s->pages, &e->lpn)) {
+    /*
+     * Another access holds the page, or a der=uffd fill is still mapping it;
+     * keep it and let the caller go uncached or wait.
+     */
+    if ((!cxl_op_holds(op, e->lpn) &&
+         g_hash_table_contains(s->pages, &e->lpn)) ||
+        femu_cxl_der_busy(&s->direct, e->lpn)) {
         op->held = true;
         return false;
     }
@@ -313,10 +284,13 @@ void femu_cxl_nvme_mark_ratio(FemuCxlMedia *s, uint64_t first, uint64_t last)
 }
 
 /* The media delay drops the BQL, so a decoder change may have intervened. */
-static bool cxl_map(FemuCxlMedia *s, uint64_t generation, uint64_t hpa,
-                    uint64_t dpa, FemuCxlEntry *e)
+static bool cxl_map(FemuCxlOp *op, uint64_t hpa, uint64_t dpa,
+                    FemuCxlEntry *e)
 {
-    if (s->invalidations != generation || s->closing ||
+    FemuCxlMedia *s = op->s;
+
+    if ((!op->handler &&
+         (s->invalidations != op->generation || s->closing)) ||
         !femu_cxl_der_map(&s->direct, hpa, dpa, e)) {
         return false;
     }
@@ -332,18 +306,102 @@ static bool cxl_map(FemuCxlMedia *s, uint64_t generation, uint64_t hpa,
  */
 static void cxl_media_full(FemuCxlMedia *s)
 {
-    if (!s->media_full++) {
+    if (!qatomic_fetch_inc(&s->media_full)) {
         warn_report("femu-cxl-ssd: NAND is full; accesses go uncached "
                     "(add over-provisioning with blocks-per-plane)");
     }
 }
 
+/*
+ * An access's lookup of @lpn, the same in every DER mode: count the hit or
+ * miss, and on a miss say whether it goes to the media uncached: without a
+ * cache, for an uncached page, or when every way of the set is pinned.
+ * Called under @cache_lock.
+ */
+FemuCxlEntry *femu_cxl_lookup(FemuCxlMedia *s, uint64_t lpn, bool write,
+                              bool *to_media)
+{
+    FemuCxlEntry *e = femu_cxl_cache_find(&s->cache, lpn);
+    bool uncached;
+
+    if (write) {
+        s->write_hits += !!e;
+        s->write_misses += !e;
+    } else {
+        s->read_hits += !!e;
+        s->read_misses += !e;
+    }
+    *to_media = false;
+    if (e) {
+        return e;
+    }
+    uncached = femu_cxl_cca_uncached(&s->cca, lpn);
+    *to_media = !s->cache.nsets || uncached ||
+                femu_cxl_cache_all_pinned(&s->cache, lpn);
+    if (s->cache.nsets && *to_media && !uncached) {
+        s->cca.pinned_set_misses++;
+    }
+    return NULL;
+}
+
+/*
+ * Give a miss on @lpn, its media read charged, a cache slot, the same in
+ * every DER mode: evict a victim, mark the page dirty if written, then
+ * insert the next prefetch-degree pages from prefetch-stride on and map
+ * them; @base is the HPA of DPA zero. Returns false, leaving the page
+ * uncached, when the victim is in use (op->held) or NAND cannot take its
+ * write-back. Called under @cache_lock.
+ */
+bool femu_cxl_fill(FemuCxlOp *op, uint64_t lpn, bool write, uint64_t base)
+{
+    FemuCxlMedia *s = op->s;
+    uint64_t stride = qatomic_read(&s->prefetch_stride);
+    /* More than the cache holds only evicts what was just fetched. */
+    uint64_t degree = MIN(qatomic_read(&s->prefetch_degree), s->cache_pages);
+    uint64_t end = MIN(s->backend.size / 4096, lpn + stride + degree);
+    FemuCxlEntry *e;
+    uint64_t next;
+
+    op->held = false;
+    e = femu_cxl_cache_insert(&s->cache, lpn, femu_cxl_evict, op);
+    if (!e) {
+        if (!op->held) {
+            cxl_media_full(s);
+        }
+        return false;
+    }
+    /* Before the prefetch: if it evicts the page, the write-back counts. */
+    if (write) {
+        e->dirty = true;
+    }
+    for (next = lpn + stride; next < end; next++) {
+        FemuCxlEntry *prefetched;
+
+        if (g_hash_table_contains(s->cache.entries, &next) ||
+            femu_cxl_cca_uncached(&s->cca, next) ||
+            femu_cxl_cache_all_pinned(&s->cache, next)) {
+            continue;
+        }
+        prefetched = femu_cxl_cache_insert(&s->cache, next, femu_cxl_evict,
+                                           op);
+        /* A prefetch is optional; never fail the demand access. */
+        if (!prefetched) {
+            break;
+        }
+        s->prefetch_inserts++;
+        if (cxl_map(op, base + next * 4096, next * 4096, NULL) &&
+            !s->direct.ops->sees_writes) {
+            prefetched->dirty = true;
+        }
+    }
+    return true;
+}
+
 MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                             uint64_t *data, unsigned size, bool write)
 {
-    FemuCxlOp op = { .s = s };
+    FemuCxlOp op = { .s = s, .generation = s->invalidations };
     MemTxResult result = MEMTX_ERROR;
-    uint64_t generation = s->invalidations;
     uint64_t pages[2];
     uint64_t first = dpa / 4096;
     uint64_t last;
@@ -384,31 +442,11 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
     op.nown = holds;
     for (lpn = first; lpn <= last; lpn++) {
         FemuCxlEntry *e;
-        bool miss;
+        bool to_media;
 
         femu_cxl_lock(s);
-        e = femu_cxl_cache_find(&s->cache, lpn);
-        miss = !e;
-
-        if (write) {
-            s->write_hits += !miss;
-            s->write_misses += miss;
-        } else {
-            s->read_hits += !miss;
-            s->read_misses += miss;
-        }
+        e = femu_cxl_lookup(s, lpn, write, &to_media);
         if (!e) {
-            /*
-             * Without a cache, for an uncached page, or when every way of
-             * the set is pinned, each access goes to the media.
-             */
-            bool uncached = femu_cxl_cca_uncached(&s->cca, lpn);
-            bool to_media = !s->cache.nsets || uncached ||
-                            femu_cxl_cache_all_pinned(&s->cache, lpn);
-
-            if (s->cache.nsets && to_media && !uncached) {
-                s->cca.pinned_set_misses++;
-            }
             femu_cxl_unlock(s);
             if (!femu_cxl_media(&op, lpn, write && to_media)) {
                 /* Report failed reads; a failed program only loses timing. */
@@ -418,50 +456,13 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                 cxl_media_full(s);
             }
             femu_cxl_lock(s);
-            if (!to_media) {
-                op.held = false;
-                e = femu_cxl_cache_insert(&s->cache, lpn, femu_cxl_evict, &op);
-                /* The victim was held: this access goes uncached. */
-                if (!e && op.held) {
-                    if (write && !femu_cxl_media(&op, lpn, true)) {
-                        cxl_media_full(s);
-                    }
-                } else if (!e) {
-                    cxl_media_full(s);
-                }
+            /* The victim was held: this access goes uncached. */
+            if (!to_media && !femu_cxl_fill(&op, lpn, write, hpa - dpa) &&
+                op.held && write && !femu_cxl_media(&op, lpn, true)) {
+                cxl_media_full(s);
             }
-        }
-        if (e && write) {
+        } else if (write) {
             e->dirty = true;
-        }
-        if (e && miss) {
-            uint64_t next;
-            /* More than the cache holds only evicts what was just fetched. */
-            uint64_t degree = MIN(s->prefetch_degree, s->cache_pages);
-            uint64_t end = MIN(s->backend.size / 4096,
-                              lpn + s->prefetch_stride + degree);
-
-            for (next = lpn + s->prefetch_stride; next < end; next++) {
-                FemuCxlEntry *prefetched;
-                uint64_t next_hpa = hpa - dpa + next * 4096;
-
-                if (g_hash_table_contains(s->cache.entries, &next) ||
-                    femu_cxl_cca_uncached(&s->cca, next) ||
-                    femu_cxl_cache_all_pinned(&s->cache, next)) {
-                    continue;
-                }
-                prefetched = femu_cxl_cache_insert(&s->cache, next,
-                                                   femu_cxl_evict, &op);
-                /* A prefetch is optional; never fail the demand access. */
-                if (!prefetched) {
-                    break;
-                }
-                s->prefetch_inserts++;
-                if (cxl_map(s, generation, next_hpa, next * 4096, NULL) &&
-                    !s->direct.ops->sees_writes) {
-                    prefetched->dirty = true;
-                }
-            }
         }
         s->cache_entries = g_hash_table_size(s->cache.entries);
         femu_cxl_unlock(s);
@@ -487,7 +488,7 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
         e = g_hash_table_lookup(s->cache.entries, &first);
         if ((e || femu_cxl_ratio_selected(s->direct.ratio, first)) &&
             !femu_cxl_cca_uncached(&s->cca, first) &&
-            cxl_map(s, generation, hpa, dpa, e) &&
+            cxl_map(&op, hpa, dpa, e) &&
             !s->direct.ops->sees_writes && e) {
             /* Direct writes cannot update metadata, so charge on eviction. */
             e->dirty = true;

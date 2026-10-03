@@ -21,6 +21,13 @@ typedef struct FemuCxlOp {
     /* When its media work starts, in QEMU_CLOCK_REALTIME ns; zero for now. */
     int64_t start;
     uint64_t ns;
+    /* The invalidation generation its mappings are valid for. */
+    uint64_t generation;
+    /*
+     * A der=uffd fault handler's: it holds neither the BQL nor the gate, and
+     * is stopped before invalidation and teardown.
+     */
+    bool handler;
     bool held;
     /* Pages this operation holds itself; its prefetch may evict them. */
     const uint64_t *own;
@@ -149,9 +156,10 @@ void femu_cxl_delay(uint64_t ns);
 void femu_cxl_lock(FemuCxlMedia *s);
 void femu_cxl_unlock(FemuCxlMedia *s);
 bool femu_cxl_media(FemuCxlOp *op, uint64_t lpn, bool write);
-int64_t femu_cxl_media_direct(FemuCxlMedia *s, uint64_t lpn, bool write,
-                              int64_t stime);
 bool femu_cxl_evict(void *opaque, FemuCxlEntry *e);
+FemuCxlEntry *femu_cxl_lookup(FemuCxlMedia *s, uint64_t lpn, bool write,
+                              bool *to_media);
+bool femu_cxl_fill(FemuCxlOp *op, uint64_t lpn, bool write, uint64_t base);
 MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                             uint64_t *data, unsigned size, bool write);
 bool femu_cxl_geometry(FemuCxlMedia *s, uint64_t size, Error **errp);
