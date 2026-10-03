@@ -779,6 +779,11 @@ static void cxl_runtime_set(Object *obj, Visitor *v, const char *name,
             error_setg(errp, "cache-ways must divide cache-pages");
             goto out;
         }
+        if (s->der && !strcmp(s->der, "uffd") && value < FEMU_UFFD_MIN_WAYS) {
+            error_setg(errp, "der=uffd needs cache-ways >= %d; der=cylon "
+                       "and der=memslot take any", FEMU_UFFD_MIN_WAYS);
+            goto out;
+        }
         if (s->started && !s->closing) {
             /* Refuse before anything is flushed if pins cannot follow. */
             if (!femu_cxl_cache_pins_fit(&s->cache, s->cache_pages, value)) {
@@ -1320,6 +1325,11 @@ static void cxl_realize(PCIDevice *dev, Error **errp)
     }
     if (!femu_cxl_policy(s->cache_policy ? s->cache_policy : "fifo", &policy)) {
         error_setg(errp, "cache-policy must be fifo, lifo, clock or s3-fifo");
+        return;
+    }
+    if (s->der && !strcmp(s->der, "uffd") &&
+        !femu_uffd_check(ct3d->hostvmem, s->cache_pages, s->cache_ways,
+                         policy, s->cca_enabled, errp)) {
         return;
     }
     if (s->read_ns > NANOSECONDS_PER_SECOND ||
@@ -2472,12 +2482,8 @@ void femu_cxl_der_init(FemuCxlDer *der, FemuCxlSsd *dev, const char *mode,
                &der_memslot_ops;
     if (der->uffd) {
         der->probes++;
-        /* CCA commands change the cache from another thread. */
-        reason = "uffd cannot follow CCA commands";
-        if (!dev->media.cca_enabled) {
-            der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
-                                                &reason);
-        }
+        der->uffd_state = femu_uffd_prepare(der, dev->parent_obj.hostvmem,
+                                            &reason);
         if (!der->uffd_state) {
             femu_cxl_der_fallback(der, reason);
         }

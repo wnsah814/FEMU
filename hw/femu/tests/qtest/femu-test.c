@@ -16028,40 +16028,63 @@ static void femu_test_cxl_uffd(void *obj, void *data, QGuestAllocator *alloc)
 }
 
 /*
- * der=uffd refuses what it cannot model: a cache of no pages, whose faulted
- * pages would stay mapped and never be charged again; a cache that would
- * evict a page an instruction still needs while it fills the next (LIFO, or
- * under 4 ways); and CCA commands, which change the cache from another
- * thread. The device then stays on MMIO.
+ * der=uffd refuses at realize what it cannot model, naming a mode that can: a
+ * backend it cannot fault on, a cache of no pages, whose faulted pages would
+ * stay mapped and never be charged again, a cache that would evict a page an
+ * instruction still needs while it fills the next (LIFO, or under 4 ways),
+ * and cca=on. A way change below 4 is refused at run time too.
  */
 static void femu_test_cxl_uffd_refuse(void *obj, void *data,
                                       QGuestAllocator *alloc)
 {
-    const char *machine =
+    static const struct {
+        const char *args;
+        const char *error;
+    } cases[] = {
+        { "'volatile-memdev':'ram'", "der=memslot takes any backend" },
+        { "'volatile-memdev':'mem','cache-pages':0", "der=off" },
+        { "'volatile-memdev':'mem','cache-policy':'lifo'",
+          "der=cylon and der=memslot take any" },
+        { "'volatile-memdev':'mem','cache-pages':16,'cache-ways':2",
+          "der=cylon and der=memslot take any" },
+        { "'volatile-memdev':'mem','cca':true",
+          "der=cylon and der=memslot do" },
+    };
+    QTestState *qts = qtest_init(
         "-machine q35,cxl=on -m 128M "
         "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 "
         "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M "
         "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
-        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on ";
-    const char *refused[] = {
-        "cache-pages=0", "cache-policy=lifo", "cache-pages=16,cache-ways=2",
-        "cca=on",
-    };
-    QTestState *qts;
-    size_t i;
+        "-object memory-backend-memfd,id=mem,size=256M,share=on,prealloc=on "
+        "-object memory-backend-ram,id=ram,size=256M ");
+    QDict *rsp;
+    unsigned i;
 
-    for (i = 0; i < ARRAY_SIZE(refused); i++) {
-        qts = qtest_initf("%s-device femu-cxl-ssd,id=ssd,bus=rp0,"
-                          "volatile-memdev=mem,der=uffd,%s", machine,
-                          refused[i]);
-        g_assert_cmpuint(femu_cxl_stat(qts, "der-fallbacks"), ==, 1);
-        femu_cxl_decode(qts);
-        qtest_writeq(qts, FEMU_CXL_WINDOW, 0x5a);
-        g_assert_false(femu_cxl_active(qts));
-        g_assert_cmphex(qtest_readq(qts, FEMU_CXL_WINDOW), ==, 0x5a);
-        qtest_quit(qts);
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        g_autofree char *cmd = g_strdup_printf(
+            "{'execute':'device_add','arguments':{'driver':'femu-cxl-ssd',"
+            "'id':'ssd','bus':'rp0','der':'uffd',%s}}", cases[i].args);
+
+        rsp = qtest_qmp(qts, "%p", qobject_from_json(cmd, NULL));
+        g_assert_true(qdict_haskey(rsp, "error"));
+        g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                             "desc"), cases[i].error));
+        qobject_unref(rsp);
     }
-
+    rsp = qtest_qmp(qts, "{'execute':'device_add','arguments':{"
+                    "'driver':'femu-cxl-ssd','id':'ssd','bus':'rp0',"
+                    "'volatile-memdev':'mem','der':'uffd','cache-pages':16,"
+                    "'cache-ways':16}}");
+    g_assert_false(qdict_haskey(rsp, "error"));
+    qobject_unref(rsp);
+    rsp = qtest_qmp(qts, "{'execute':'qom-set','arguments':{"
+                    "'path':'/machine/peripheral/ssd','property':'cache-ways',"
+                    "'value':2}}");
+    g_assert_true(qdict_haskey(rsp, "error"));
+    g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                         "desc"), "der=uffd needs"));
+    qobject_unref(rsp);
+    qtest_quit(qts);
 }
 
 static void femu_test_cxl_no_ftl(void *obj, void *data,

@@ -4,10 +4,24 @@
 
 #include "hw/cxl/cxl_host.h"
 #include "system/hostmem.h"
+#include "cache.h"
+
+/*
+ * One instruction may need several pages mapped at once: a string copy
+ * between CXL buffers, an access across a page boundary, code or page tables
+ * on the device. Filling the last must not evict the others, as LIFO does
+ * (its victim is the newest entry) and a small set does when they share it;
+ * the instruction would fault on them in turn forever. Four ways cover code,
+ * source, destination and a page-table page: a rule of thumb, not a bound.
+ */
+#define FEMU_UFFD_MIN_WAYS 4
 
 typedef struct FemuUffd FemuUffd;
 typedef struct FemuCxlDer FemuCxlDer;
 
+bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
+                     uint32_t ways, FemuCxlPolicy policy, bool cca,
+                     Error **errp);
 FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                             const char **reason);
 bool femu_uffd_map(FemuCxlDer *der, CXLFixedWindow *fw, Object *owner);

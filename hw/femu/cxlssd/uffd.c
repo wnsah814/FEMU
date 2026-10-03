@@ -13,6 +13,7 @@
  * handler never takes the BQL.
  */
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
@@ -81,6 +82,45 @@ static FemuCxlMedia *uffd_media(FemuUffd *u)
     return container_of(u->der, FemuCxlMedia, direct);
 }
 
+/*
+ * What the device is configured with and der=uffd cannot model fails realize
+ * with a mode that can; what the host lacks only falls back to MMIO (see
+ * femu_uffd_prepare()), as der=cylon does on an unpatched kernel.
+ */
+bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
+                     uint32_t ways, FemuCxlPolicy policy, bool cca,
+                     Error **errp)
+{
+    int fd = memory_region_get_fd(host_memory_backend_get_memory(backend));
+    struct statfs fs;
+
+    if (fd < 0 || !backend->share || !backend->prealloc ||
+        fstatfs(fd, &fs) || fs.f_type != TMPFS_MAGIC) {
+        error_setg(errp, "der=uffd needs a shared, preallocated "
+                   "memory-backend-memfd; der=memslot takes any backend");
+        return false;
+    }
+    /* A page the cache cannot hold would stay mapped and never be charged. */
+    if (!pages) {
+        error_setg(errp, "der=uffd needs a cache (cache-pages > 0); without "
+                   "one, der=off charges every access");
+        return false;
+    }
+    if (policy == FEMU_CXL_LIFO || ways < FEMU_UFFD_MIN_WAYS) {
+        error_setg(errp, "der=uffd needs cache-policy other than lifo and "
+                   "cache-ways >= %d; der=cylon and der=memslot take any",
+                   FEMU_UFFD_MIN_WAYS);
+        return false;
+    }
+    if (cca) {
+        error_setg(errp, "der=uffd does not take cca=on; der=cylon and "
+                   "der=memslot do");
+        return false;
+    }
+    return true;
+}
+
+/* The host's side: userfaultfd access and kernel features. */
 FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                             const char **reason)
 {
@@ -91,33 +131,8 @@ FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                     UFFD_FEATURE_THREAD_ID,
     };
     const uint64_t features = api.features;
-    struct statfs fs;
     FemuUffd *u;
-    int fd = memory_region_get_fd(mr);
 
-    *reason = "uffd needs a shared, preallocated memory-backend-memfd";
-    if (fd < 0 || !backend->share || !backend->prealloc ||
-        fstatfs(fd, &fs) || fs.f_type != TMPFS_MAGIC) {
-        return NULL;
-    }
-    /* A page the cache cannot hold would stay mapped and never be charged. */
-    *reason = "uffd needs a cache (cache-pages > 0)";
-    if (!der->cache->nsets) {
-        return NULL;
-    }
-    /*
-     * One instruction may need several pages mapped at once: a string copy
-     * between CXL buffers, an access across a page boundary, code or page
-     * tables on the device. Filling the last must not evict the others, as
-     * LIFO does (its victim is the newest entry) and a small set does when
-     * they share it; the instruction would fault on them in turn forever.
-     * Four ways cover code, source, destination and a page-table page: a
-     * rule of thumb, not a bound.
-     */
-    *reason = "uffd needs cache-policy other than lifo and cache-ways >= 4";
-    if (der->cache->policy == FEMU_CXL_LIFO || der->cache->ways < 4) {
-        return NULL;
-    }
     u = g_new0(FemuUffd, 1);
     /*
      * Kernel-mode faults (KVM's) need access to /dev/userfaultfd, or else
@@ -531,10 +546,11 @@ static bool uffd_continue_wp(FemuUffd *u)
     return ok;
 }
 
-/* See femu_uffd_prepare(); cache-ways can change at run time. */
+/* See femu_uffd_check(); the setters keep this true at run time. */
 static bool uffd_cache_fits(FemuCxlCache *c)
 {
-    return c->nsets && c->policy != FEMU_CXL_LIFO && c->ways >= 4;
+    return c->nsets && c->policy != FEMU_CXL_LIFO &&
+           c->ways >= FEMU_UFFD_MIN_WAYS;
 }
 
 /*
@@ -673,6 +689,14 @@ void femu_uffd_destroy(FemuCxlDer *der)
     der->uffd_state = NULL;
 }
 #else
+bool femu_uffd_check(HostMemoryBackend *backend, uint32_t pages,
+                     uint32_t ways, FemuCxlPolicy policy, bool cca,
+                     Error **errp)
+{
+    error_setg(errp, "der=uffd needs Linux");
+    return false;
+}
+
 FemuUffd *femu_uffd_prepare(FemuCxlDer *der, HostMemoryBackend *backend,
                             const char **reason)
 {

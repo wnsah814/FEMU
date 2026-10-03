@@ -210,18 +210,24 @@ access with no other in progress maps the window (with `concurrent-misses=on`,
 or under `auto` just after the window is unmapped), and an MMIO access still in
 flight after that only copies. Invalidation, flush, a way change and anything
 else that clears direct mappings stop the handler; the next access maps the
-window again. The mode needs Linux 6.4
-(`UFFDIO_CONTINUE_MODE_WP`), access to `/dev/userfaultfd` or `CAP_SYS_PTRACE`
-under KVM, and a window that decodes linearly onto the device from DPA zero. The
-guest should pass HLT through (`-overcommit cpu-pm=on`) and turn off PV async
-page faults, or KVM's async-PF worker faults every page in for write. It refuses,
-and stays on MMIO, with no cache, `cache-policy=lifo`, fewer than 4 ways (one
-instruction may need several pages mapped at once), and `cca=on`; a direct
-ratio maps its pages as they are first touched, outside the cache, with no
-media cost and without write protection, so writes to them are not charged; a
-linked NVMe controller is refused outright. Prefetch works as on
-the MMIO path: the pages after a miss are inserted and mapped with no media
-read.
+window again.
+
+What the device is configured with and `der=uffd` cannot model fails realize,
+and the error names a mode that can: a backend other than a shared,
+preallocated `memory-backend-memfd` (`der=memslot`), no cache (`der=off`),
+`cache-policy=lifo` or fewer than 4 ways (`der=cylon`, `der=memslot`; one
+instruction may need several pages mapped at once), and `cca=on`. Setting
+`cache-ways` below 4 at run time is refused the same way. What the host lacks
+only falls back to MMIO with a warning, as `der=cylon` does on an unpatched
+kernel: the mode needs Linux 6.4 (`UFFDIO_CONTINUE_MODE_WP`), access to
+`/dev/userfaultfd` or `CAP_SYS_PTRACE` under KVM, and a window that decodes
+linearly onto the device from DPA zero. The guest should pass HLT through
+(`-overcommit cpu-pm=on`) and turn off PV async page faults, or KVM's async-PF
+worker faults every page in for write. A direct ratio maps its pages as they
+are first touched, outside the cache, with no media cost and without write
+protection, so writes to them are not charged; a linked NVMe controller is
+refused outright. Prefetch works as on the MMIO path: the pages after a miss
+are inserted and mapped with no media read.
 
 ### Memslot mapping limit
 
