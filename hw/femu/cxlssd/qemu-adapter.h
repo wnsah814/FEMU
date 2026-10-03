@@ -136,6 +136,8 @@ void femu_cxl_enter_access(FemuCxlMedia *s);
 void femu_cxl_leave_access(FemuCxlMedia *s);
 void femu_cxl_delay(uint64_t ns);
 bool femu_cxl_media(FemuCxlOp *op, uint64_t lpn, bool write);
+int64_t femu_cxl_media_direct(FemuCxlMedia *s, uint64_t lpn, bool write,
+                              int64_t stime);
 bool femu_cxl_evict(void *opaque, FemuCxlEntry *e);
 MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                             uint64_t *data, unsigned size, bool write);

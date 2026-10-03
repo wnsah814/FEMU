@@ -88,13 +88,26 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | Property | Type | Description |
 | --- | --- | --- |
 | `der-active` | `bool` | Read-only: whether direct mapping is available on this device |
-| `der-probes` | `uint64` | Read-only: probe attempts, one per realize with der=cylon |
+| `der-probes` | `uint64` | Read-only: probe attempts, one per realize with der=cylon or der=uffd |
 | `der-mapped` | `uint64` | Read-only gauge: pages currently mapped for direct guest access |
 | `der-remaps` | `uint64` | Read-only: direct page mappings installed |
 | `der-revocations` | `uint64` | Read-only: direct page mappings removed |
 | `der-quiet-revocations` | `uint64` | Read-only: Cylon revocations of entries whose accessed bit was clear, done without a TLB flush |
 | `der-replacements` | `uint64` | Read-only: memslot aliases displaced by a hotter page |
 | `der-fallbacks` | `uint64` | Read-only: refused direct mapping attempts and device disablements |
+
+### userfaultfd mapping counters
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `uffd-faults` | `uint64` | Read-only event counter: missing-page faults the der=uffd handler took |
+| `uffd-wp-faults` | `uint64` | Read-only event counter: first-write faults the der=uffd handler took, each marking a resident page dirty |
+| `uffd-pending-victims` | `uint64` | Read-only event counter: der=uffd evictions refused because the victim was being filled or pinned for the thread that faulted |
+| `uffd-stop-faults` | `uint64` | Read-only event counter: faults the der=uffd handler took after it was asked to stop |
+| `uffd-ns-ftl` | `uint64` | Read-only: time in ns the der=uffd handler spent in FTL calls |
+| `uffd-ns-zap` | `uint64` | Read-only: time in ns the der=uffd handler spent zapping victims |
+| `uffd-ns-continue` | `uint64` | Read-only: time in ns the der=uffd handler spent in UFFDIO_CONTINUE |
+| `uffd-ns-busy` | `uint64` | Read-only: time in ns the der=uffd handler spent awake, all work included |
 
 ### Caching API counters
 

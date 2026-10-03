@@ -4,6 +4,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu-adapter.h"
+#include "uffd.h"
 
 /*
  * BQL protects the gate. Accesses share it, so misses to different pages
@@ -100,6 +101,16 @@ void femu_cxl_delay(uint64_t ns)
     bql_lock();
 }
 
+/* Run one request on the FTL; called under @lock. */
+static int64_t cxl_ftl_run(FemuCxlMedia *s, NvmeRequest *req)
+{
+    if (s->first_touch_program && req->cmd.opcode == NVME_CMD_READ &&
+        s->ns.ssd->maptbl[req->slba / 8].ppa == UNMAPPED_PPA) {
+        req->cmd.opcode = NVME_CMD_WRITE;
+    }
+    return bb_ftl_process_req(s->ctrl, &s->ns, req);
+}
+
 /* Only metadata reaches the worker; the vCPU owns all payload access. */
 static void *cxl_worker(void *opaque)
 {
@@ -114,12 +125,7 @@ static void *cxl_worker(void *opaque)
             continue;
         }
         QSIMPLEQ_REMOVE_HEAD(&s->work, next);
-        if (s->first_touch_program &&
-            work->req.cmd.opcode == NVME_CMD_READ &&
-            s->ns.ssd->maptbl[work->req.slba / 8].ppa == UNMAPPED_PPA) {
-            work->req.cmd.opcode = NVME_CMD_WRITE;
-        }
-        work->latency = bb_ftl_process_req(s->ctrl, &s->ns, &work->req);
+        work->latency = cxl_ftl_run(s, &work->req);
         work->done = true;
         qemu_cond_broadcast(&s->wake);
     }
@@ -178,6 +184,39 @@ static bool cxl_op_holds(FemuCxlOp *op, uint64_t lpn)
         }
     }
     return false;
+}
+
+/*
+ * der=uffd: the fault handler's media access, outside the BQL and the gate,
+ * starting at @stime; returns its latency. Like a linked controller's request,
+ * it runs on the FTL under @lock. While uffd is mapped, MMIO accesses only
+ * copy, so the handler is the only writer of the media counters; QOM reads
+ * them under the BQL.
+ */
+int64_t femu_cxl_media_direct(FemuCxlMedia *s, uint64_t lpn, bool write,
+                              int64_t stime)
+{
+    NvmeRequest req = {
+        .cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ,
+        .ns = &s->ns,
+        .slba = lpn * 8,
+        .nlb = 8,
+        .stime = stime,
+    };
+    int64_t latency;
+
+    if (!s->ftl) {
+        return 0;
+    }
+    qemu_mutex_lock(&s->lock);
+    latency = cxl_ftl_run(s, &req);
+    qatomic_set(&s->media_writes, ssd_nand_write_pages(s->ns.ssd));
+    qemu_mutex_unlock(&s->lock);
+    if (req.cmd.opcode == NVME_CMD_READ) {
+        qatomic_inc(&s->media_reads);
+    }
+    qatomic_add(&s->media_ns, latency);
+    return latency;
 }
 
 bool femu_cxl_evict(void *opaque, FemuCxlEntry *e)
@@ -299,6 +338,15 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
         return MEMTX_ERROR;
     }
     last = (dpa + size - 1) / 4096;
+    /* uffd owns the cache once mapped; a late MMIO access only copies. */
+    if (femu_uffd_installed(&s->direct)) {
+        if (write) {
+            memcpy((uint8_t *)s->backend.logical_space + dpa, data, size);
+        } else {
+            memcpy(data, (uint8_t *)s->backend.logical_space + dpa, size);
+        }
+        return MEMTX_OK;
+    }
     /*
      * Hold the pages, in ascending order, so accesses to a page stay ordered
      * and a second miss to it waits for the first fill instead of repeating it.
@@ -383,7 +431,7 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
                 }
                 s->prefetch_inserts++;
                 if (cxl_map(s, generation, next_hpa, next * 4096, NULL) &&
-                    !s->direct.cylon) {
+                    !s->direct.cylon && !s->direct.uffd) {
                     prefetched->dirty = true;
                 }
             }
@@ -410,7 +458,7 @@ MemTxResult femu_cxl_access(FemuCxlMedia *s, uint64_t hpa, uint64_t dpa,
         if ((e || femu_cxl_ratio_selected(s->direct.ratio, first)) &&
             !femu_cxl_cca_uncached(&s->cca, first) &&
             cxl_map(s, generation, hpa, dpa, e) &&
-            !s->direct.cylon && e) {
+            !s->direct.cylon && !s->direct.uffd && e) {
             /* Direct writes cannot update metadata, so charge on eviction. */
             e->dirty = true;
         }

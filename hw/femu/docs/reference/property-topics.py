@@ -265,6 +265,15 @@ DEVICES = [
                 ],
             },
             {
+                "title": "userfaultfd mapping counters",
+                "kind": "runtime",
+                "props": [
+                    "uffd-faults", "uffd-wp-faults", "uffd-pending-victims",
+                    "uffd-stop-faults", "uffd-ns-ftl", "uffd-ns-zap",
+                    "uffd-ns-continue", "uffd-ns-busy",
+                ],
+            },
+            {
                 "title": "Caching API counters",
                 "kind": "runtime",
                 "props": [

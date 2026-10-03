@@ -4,6 +4,7 @@
 
 #include "cache.h"
 typedef struct FemuCylon FemuCylon;
+typedef struct FemuUffd FemuUffd;
 typedef struct FemuCxlSsd FemuCxlSsd;
 
 typedef struct FemuCxlDer {
@@ -17,6 +18,17 @@ typedef struct FemuCxlDer {
     bool warned;
     bool cylon;
     FemuCylon *fast;
+    bool uffd;
+    FemuUffd *uffd_state;
+    uint64_t uffd_faults;
+    uint64_t uffd_wp_faults;
+    uint64_t uffd_pending_victims;
+    uint64_t uffd_stop_faults;  /* faults taken after a stop request */
+    /* uffd handler time, ns: FTL calls, victim zaps, continues, all work */
+    uint64_t uffd_ns_ftl;
+    uint64_t uffd_ns_zap;
+    uint64_t uffd_ns_continue;
+    uint64_t uffd_ns_busy;
     FemuCxlCache *cache;
     /* Windows that route here, valid for one invalidation generation. */
     GPtrArray *windows;
